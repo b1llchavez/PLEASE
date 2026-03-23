@@ -1,5 +1,6 @@
+.venv/
 bgyo_env/
 __pycache__/
 *.pyc
+*.db
 final-proj-na-sana.zip
-.venv
