@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   BGYO: THE LIGHT STAGE — ACES OF P-POP  v18.3                 ║
+║   BGYO: THE LIGHT STAGE — ACES OF P-POP  v18.5                 ║
 ║   bgyo_game.py  ·  Main entry point                             ║
 ║   3D Rhythm Game + Trivia  |  Python / tkinter + pygame         ║
 ╚══════════════════════════════════════════════════════════════════╝
@@ -18,6 +18,57 @@ FOLDER STRUCTURE:
     bgyo_during_game.png  (or .jpg)
     ranking_icon.png      ← optional
   images/covers/  ← Song cover art PNGs (same name as song)
+
+v18.5 ENHANCEMENTS (User-Requested)
+  Aces Trivia Intro Screen — Big Title Above Stars
+  • Title "✦ BGYO ACES TRIVIA ✦" is now a LARGE fullscreen canvas at the very top
+  • Stars / spotlights background is always visible through the transparent overlay
+  • Title animates with color-cycling + breath-pulse glow over the star field
+  • Horizontal MEMBER_COLORS separator sits directly below the title
+  • Card with stat badges, instructions, and buttons is positioned below the band
+  • Instruction text updated to mention time-based tiebreaker on leaderboard
+
+  Aces Trivia Rankings — Time-Based Tiebreaker
+  • time_taken (float, seconds) is now stored with every trivia score
+  • database.py adds "time_taken REAL DEFAULT 0.0" via safe ALTER TABLE migration
+  • Leaderboard sort: score DESC → time_taken ASC → played_at DESC
+  • TIME column displayed in the trivia rankings table (format: "42.3s")
+  • Personal best bar also shows the player's fastest winning time
+
+v18.5 ENHANCEMENTS (User-Requested)
+  Trivia Intro Screen — Title Above Line + Stars Background
+  • Big animated title is now unambiguously ABOVE the separator line and card
+  • Layout order enforced: title strip (top) → rainbow separator → info card
+  • outer frame uses BG_COL so the main-loop star + spotlight canvas shows through
+  • Title canvas also uses BG_COL background — stars visible through transparent gaps
+  • Separator height increased to 8 px for a bolder visual divider
+  • Card top/height recalculated so it fits neatly in the remaining vertical space
+
+  Trivia Rankings — Speed-Based Tiebreaker
+  • Ranking now: score DESC → time_taken ASC → played_at DESC
+  • Fastest total session time breaks equal-score ties on the leaderboard
+  • TIME(s) column added to the trivia rankings table
+  • Results screen now shows total time in the stat strip so players
+    see their speed before choosing to save
+  • time_taken saved alongside score/total in every db.save_trivia_score() call
+
+  database.py — time_taken Column Added to trivia_scores
+  • trivia_scores CREATE TABLE now includes time_taken REAL DEFAULT 0.0
+  • Safe ALTER TABLE migration for existing databases (no data loss)
+  • save_trivia_score() accepts optional time_taken float parameter
+  • load_trivia_scores() and load_trivia_scores_for_account() now sort
+    by score DESC, time_taken ASC, played_at DESC
+
+v18.4 ENHANCEMENTS (User-Requested)
+  Aces Trivia Rankings — Dedicated Leaderboard
+  • New _show_trivia_rankings() screen lists top 50 trivia scores across all players
+  • Columns: Rank · Player · Correct · Total · Acc% · Grade · Date
+  • Grade derived per-row using the same thresholds as _tv_end() (S/A/B/C/D)
+  • Logged-in player rows gold-tinted (★ prefix, bold) — same style as rhythm board
+  • Personal best trivia summary bar below the table for registered accounts
+  • "✦ ACES TRIVIA RANKINGS" pixel-style button added to the rhythm rankings footer
+  • Trivia rankings has "◆ RHYTHM RANKINGS" and "⌂ MAIN STAGE" back-navigation buttons
+  • ESC key now also exits the trivia_rankings screen back to the main stage
 
 v18.3 ENHANCEMENTS (User-Requested)
   Game Banner Photo Repositioned
@@ -223,7 +274,7 @@ class BGYOGame:
         ensure_dirs()
 
         self.root = tk.Tk()
-        self.root.title("The Light Stage: Aces of P-Pop  v18.3")
+        self.root.title("The Light Stage: Aces of P-Pop  v18.5")
         self.root.resizable(False, False)
         self.root.configure(bg=BG_COL)
 
@@ -276,6 +327,7 @@ class BGYOGame:
         self._tv_timer_start  = 0.0
         self._tv_time_limit   = 15.0
         self._tv_waiting      = False  # ENHANCED v18.1: transition state
+        self._tv_time_taken   = 0.0   # cumulative seconds used across all answers
 
         # ── Carousel / song select ────────────────────────────────────
         self._carousel_idx    = 0
@@ -290,8 +342,10 @@ class BGYOGame:
         self._overlay_frame = None
 
         # ── Canvas button hit-testing ─────────────────────────────────
-        self._nav_pressed = None
-        self._badge_frame = None   # home screen profile badge (animated glow border)
+        self._nav_pressed    = None
+        self._badge_frame    = None   # home screen profile badge (animated glow border)
+        self._tc_btn_rects   = {}     # trivia confirm screen canvas button hit-rects
+        self._tc_btn_press   = None   # currently depressed trivia confirm button key
 
         # ── Image cache ───────────────────────────────────────────────
         self.img_refs = {}
@@ -1014,6 +1068,11 @@ class BGYOGame:
             for i, (lbl, col, cb, bx1, by1, bx2, by2) in enumerate(self._nav_btns_layout()):
                 if bx1 <= ev.x <= bx2 and by1 <= ev.y <= by2:
                     self._nav_pressed = i; return
+        if self.screen == "trivia_confirm":
+            for key, (bx1, by1, bx2, by2) in getattr(self, "_tc_btn_rects", {}).items():
+                if bx1 <= ev.x <= bx2 and by1 <= ev.y <= by2:
+                    self._tc_btn_press = key; return
+            self._tc_btn_press = None
         self._nav_pressed = None
 
     def _on_canvas_release(self, ev):
@@ -1023,6 +1082,19 @@ class BGYOGame:
                 if i == pi and bx1 <= ev.x <= bx2 and by1 <= ev.y <= by2:
                     self._play_click()
                     self._fade_to(cb); return
+        if self.screen == "trivia_confirm":
+            pk = getattr(self, "_tc_btn_press", None)
+            self._tc_btn_press = None
+            rects = getattr(self, "_tc_btn_rects", {})
+            if pk and pk in rects:
+                bx1, by1, bx2, by2 = rects[pk]
+                if bx1 <= ev.x <= bx2 and by1 <= ev.y <= by2:
+                    self._play_click()
+                    if pk == "start":
+                        self._fade_to(self._start_trivia)
+                    elif pk == "back":
+                        self._fade_to(self._show_title)
+            return
         self._nav_pressed = None
 
     # ═══════════════════════════════════════════════════════════════
@@ -1564,18 +1636,19 @@ class BGYOGame:
     # ═══════════════════════════════════════════════════════════════
     def _show_rankings(self):
         self._clear_widgets(); self.screen = "rankings"
-        outer = tk.Frame(self.root, bg="#04000C",
+        # BG_COL background lets the star/spotlight canvas show through the frame gaps
+        outer = tk.Frame(self.root, bg=BG_COL,
                          highlightbackground="#FFD700", highlightthickness=2)
         outer.place(relx=0.5, rely=0.5, anchor="center", width=min(820, int(_W*0.88)), height=min(600, int(_H*0.88)))
 
-        hdr = tk.Frame(outer, bg="#04000C"); hdr.pack(pady=(20, 4))
+        hdr = tk.Frame(outer, bg=BG_COL); hdr.pack(pady=(20, 4))
         if "ranking_icon" in self.img_refs:
-            tk.Label(hdr, image=self.img_refs["ranking_icon"], bg="#04000C").pack(side="left", padx=(0, 10))
-        tk.Label(hdr, text="THE LIGHT STAGE  —  TOP ACES", bg="#04000C", fg="#FFD700",
+            tk.Label(hdr, image=self.img_refs["ranking_icon"], bg=BG_COL).pack(side="left", padx=(0, 10))
+        tk.Label(hdr, text="THE LIGHT STAGE  —  TOP ACES", bg=BG_COL, fg="#FFD700",
                  font=(UI_FONT, 20, "bold")).pack(side="left")
 
         # Difficulty filter tabs — colorful pixel-style
-        tab_f   = tk.Frame(outer, bg="#04000C"); tab_f.pack(pady=(4, 0))
+        tab_f   = tk.Frame(outer, bg=BG_COL); tab_f.pack(pady=(4, 0))
         tab_var = tk.StringVar(value="All")
         tab_cvs = {}
         TAB_COLORS = {
@@ -1616,7 +1689,7 @@ class BGYOGame:
         for diff_name in ["All", "Easy", "Normal", "Hard", "ACE"]:
             col  = TAB_COLORS[diff_name]
             cv_t = tk.Canvas(tab_f, width=TBW, height=TBH,
-                             bg="#04000C", highlightthickness=0, cursor="hand2")
+                             bg=BG_COL, highlightthickness=0, cursor="hand2")
             cv_t.pack(side="left", padx=3)
             _tp = [False]
             def _make_tab_handlers(val_, cv_, col_):
@@ -1729,10 +1802,184 @@ class BGYOGame:
                          bg="#0a0018", fg="#666666",
                          font=(UI_FONT, 9)).pack(side="left", padx=10, pady=6)
 
-        bf = tk.Frame(outer, bg="#04000C"); bf.pack(pady=(8, 16))
+        # Bottom button row — MAIN STAGE and ACES TRIVIA RANKINGS side-by-side
+        bf = tk.Frame(outer, bg=BG_COL); bf.pack(pady=(8, 16))
         self._pixel_btn(bf, "⌂  MAIN STAGE", BTN_COLORS[2],
                         lambda: self._fade_to(self._show_title), width=180).pack(side="left", padx=10)
+        # Trivia rankings button — same pixel-style as all other buttons
+        self._pixel_btn(bf, "✦  ACES TRIVIA RANKINGS", BTN_COLORS[0],
+                        lambda: self._fade_to(self._show_trivia_rankings), width=230).pack(side="left", padx=10)
         # NOTE: "Clear All Scores" button intentionally NOT present (spec requirement)
+
+    # ── Aces Trivia Leaderboard ───────────────────────────────────────
+    def _show_trivia_rankings(self):
+        """
+        Dedicated leaderboard for the Aces Trivia game.
+        Shows top scores (correct / total, accuracy %) for all players.
+        Logged-in player's rows are gold-highlighted with a ★ prefix,
+        and a personal-best summary bar is shown below the table.
+        Mirrors the visual style of _show_rankings() exactly.
+        """
+        self._clear_widgets(); self.screen = "trivia_rankings"
+
+        # BG_COL background lets the star/spotlight canvas show through the frame gaps
+        outer = tk.Frame(self.root, bg=BG_COL,
+                         highlightbackground="#FFD700", highlightthickness=2)
+        outer.place(relx=0.5, rely=0.5, anchor="center",
+                    width=min(820, int(_W * 0.88)), height=min(600, int(_H * 0.88)))
+
+        # ── Header ───────────────────────────────────────────────────
+        hdr = tk.Frame(outer, bg=BG_COL); hdr.pack(pady=(20, 4))
+        if "ranking_icon" in self.img_refs:
+            tk.Label(hdr, image=self.img_refs["ranking_icon"],
+                     bg=BG_COL).pack(side="left", padx=(0, 10))
+        tk.Label(hdr, text="✦  ACES TRIVIA  —  TOP SCHOLARS", bg=BG_COL, fg="#FFD700",
+                 font=(UI_FONT, 20, "bold")).pack(side="left")
+
+        # Subtitle — ranking criteria: accuracy first, then speed, then recency
+        tk.Label(outer,
+                 text="Most correct answers first  ·  equal scores ranked by fastest total time  ·  then most recent",
+                 bg=BG_COL, fg="#556677", font=(UI_FONT, 9)).pack()
+
+        # ── Column header row ────────────────────────────────────────
+        TV_COL_DEFS = [
+            ("#",         4),
+            ("PLAYER",   16),
+            ("CORRECT",   9),
+            ("TOTAL",     7),
+            ("ACC %",     7),
+            ("TIME (s)",  9),
+            ("GRADE",     7),
+            ("DATE",     11),
+        ]
+        hdr_f = tk.Frame(outer, bg="#1a0040"); hdr_f.pack(fill="x", padx=20, pady=(8, 0))
+        for col_txt, col_w in TV_COL_DEFS:
+            tk.Label(hdr_f, text=col_txt, bg="#1a0040", fg="#FFD700",
+                     font=(UI_FONT, 10, "bold"), width=col_w,
+                     anchor="center").pack(side="left", padx=2, pady=4)
+
+        # ── Scrollable table ─────────────────────────────────────────
+        table_f = tk.Frame(outer, bg="#04000C")
+        table_f.pack(fill="both", expand=True, padx=20, pady=2)
+        tv_scroll = tk.Scrollbar(table_f); tv_scroll.pack(side="right", fill="y")
+        tv_cv     = tk.Canvas(table_f, bg="#04000C", highlightthickness=0,
+                              yscrollcommand=tv_scroll.set)
+        tv_cv.pack(fill="both", expand=True)
+        tv_scroll.config(command=tv_cv.yview)
+        tv_rows_f = tk.Frame(tv_cv, bg="#04000C")
+        tv_cv.create_window((0, 0), window=tv_rows_f, anchor="nw")
+
+        # Grade colours reused from the rhythm-game leaderboard for consistency
+        tv_rank_colors = {
+            "S": "#FFD700", "A": "#00FF99",
+            "B": "#00E5FF", "C": "#FF8800", "D": "#FF3385",
+        }
+
+        # Grade thresholds that mirror _tv_end() — applied per-row so the
+        # leaderboard is self-consistent even without a stored grade column.
+        def _trivia_grade(score, total):
+            """Derive a letter grade from correct / total the same way _tv_end() does."""
+            pct = int(score / max(total, 1) * 100)
+            if score == total:   return "S"
+            if pct >= 80:        return "A"
+            if pct >= 60:        return "B"
+            if pct >= 40:        return "C"
+            return "D"
+
+        # Current logged-in username for row highlighting — None for guests
+        _logged_user = session.username if not session.is_guest else None
+
+        # Populate table with top 50 trivia scores from database
+        tv_scores = db.load_trivia_scores(50)
+        for i, s in enumerate(tv_scores, 1):
+            score_val = s.get("score", 0)
+            total_val = s.get("total", 12)
+            pct_val   = int(score_val / max(total_val, 1) * 100)
+            grade_val = _trivia_grade(score_val, total_val)
+            grade_col = tv_rank_colors.get(grade_val, "#CCCCCC")
+
+            # Highlight the logged-in player's row — same treatment as rhythm leaderboard
+            is_me   = (_logged_user and
+                       s.get("player_name", "").lower() == _logged_user.lower())
+            row_bg  = ("#1a1200" if is_me else
+                       "#0a0020" if i % 2 == 0 else "#060014")
+            row     = tk.Frame(tv_rows_f, bg=row_bg,
+                                highlightbackground="#FFD700" if is_me else row_bg,
+                                highlightthickness=1 if is_me else 0)
+            row.pack(fill="x", pady=1)
+
+            # Star prefix on the player-name cell for the logged-in user
+            name_txt = (f"★ {s.get('player_name', '?')}" if is_me
+                        else s.get("player_name", "?"))
+            name_col = "#FFD700" if is_me else grade_col
+
+            # time_taken stored as float seconds; format to 1 decimal, cap display
+            time_val  = s.get("time_taken", 0.0)
+            time_disp = f"{time_val:.1f}s" if time_val > 0 else "—"
+
+            tv_cells = [
+                (str(i),               4,  "#FFD700" if is_me else "#888888"),
+                (name_txt[:16],       16,  name_col),
+                (str(score_val),       9,  "#00FF99"),
+                (str(total_val),       7,  "#AAAAAA"),
+                (f"{pct_val}%",        7,  "#00E5FF"),
+                (time_disp,            9,  "#FF8800"),
+                (grade_val,            7,  grade_col),
+                (s.get("played_at", "")[:10], 11, "#666666"),
+            ]
+            for txt, w_, fc in tv_cells:
+                tk.Label(row, text=txt, bg=row_bg, fg=fc,
+                         font=(UI_FONT, 10, "bold" if is_me else "normal"),
+                         width=w_, anchor="center").pack(side="left", padx=2, pady=3)
+
+        if not tv_scores:
+            tk.Label(tv_rows_f,
+                     text="  No trivia scores yet — be the first ACE Scholar!",
+                     bg="#04000C", fg="#666666", font=(UI_FONT, 11)).pack(pady=20)
+
+        tv_rows_f.update_idletasks()
+        tv_cv.config(scrollregion=tv_cv.bbox("all"))
+
+        # ── Logged-in player's personal trivia best (below the table) ─
+        if not session.is_guest:
+            pb_tv = db.load_trivia_scores_for_account(session.account_id, 1)
+            pb_f2 = tk.Frame(outer, bg="#0a0018",
+                             highlightbackground="#FFD700", highlightthickness=1)
+            pb_f2.pack(fill="x", padx=20, pady=(4, 0))
+            tk.Label(pb_f2, text=f"✦  YOUR BEST TRIVIA — {session.username.upper()}",
+                     bg="#0a0018", fg="#FFD700",
+                     font=(UI_FONT, 10, "bold")).pack(side="left", padx=(12, 20), pady=6)
+            if pb_tv:
+                pb2       = pb_tv[0]
+                pb2_score = pb2.get("score", 0)
+                pb2_total = pb2.get("total", 12)
+                pb2_pct   = int(pb2_score / max(pb2_total, 1) * 100)
+                pb2_grade = _trivia_grade(pb2_score, pb2_total)
+                pb2_time  = pb2.get("time_taken", 0.0)
+                pb2_tdisp = f"{pb2_time:.1f}s" if pb2_time > 0 else "—"
+                for lbl3, val3, vc3 in [
+                    ("CORRECT", str(pb2_score),          "#00FF99"),
+                    ("TOTAL",   str(pb2_total),           "#AAAAAA"),
+                    ("ACC",     f"{pb2_pct}%",            "#00E5FF"),
+                    ("TIME",    pb2_tdisp,                "#FF8800"),
+                    ("GRADE",   pb2_grade,                tv_rank_colors.get(pb2_grade, "#888")),
+                    ("DATE",    pb2.get("played_at", "")[:10], "#666666"),
+                ]:
+                    tk.Label(pb_f2, text=f"{lbl3}: {val3}", bg="#0a0018", fg=vc3,
+                             font=(UI_FONT, 9, "bold")).pack(side="left", padx=10, pady=6)
+            else:
+                tk.Label(pb_f2, text="No trivia scores saved yet — play Aces Trivia!",
+                         bg="#0a0018", fg="#666666",
+                         font=(UI_FONT, 9)).pack(side="left", padx=10, pady=6)
+
+        # ── Bottom navigation buttons ────────────────────────────────
+        bf2 = tk.Frame(outer, bg=BG_COL); bf2.pack(pady=(8, 16))
+        # Back to rhythm leaderboard — same pixel-style button
+        self._pixel_btn(bf2, "◆  RHYTHM RANKINGS", BTN_COLORS[1],
+                        lambda: self._fade_to(self._show_rankings), width=210).pack(side="left", padx=10)
+        # Back to main stage
+        self._pixel_btn(bf2, "⌂  MAIN STAGE", BTN_COLORS[2],
+                        lambda: self._fade_to(self._show_title), width=180).pack(side="left", padx=10)
 
     # ═══════════════════════════════════════════════════════════════
     #  TRIVIA
@@ -1740,134 +1987,211 @@ class BGYOGame:
     def _show_trivia_confirmation(self):
         """
         Intro/confirmation screen before the trivia game begins.
-        Features an animated color-cycling title, centered instructions
-        aligned with the card, and properly sized text throughout.
+        Entirely canvas-drawn — zero tk widget overlay — so the live
+        star/spotlight animation shows through every pixel of the screen.
+
+        _draw_trivia_confirm_canvas() renders the full UI on self.cv each
+        frame: constellation lines, animated title, frosted card panel,
+        stat badges, instruction text, and pixel buttons.
+        Hit-testing for the two buttons lives in _on_canvas_press/release.
         """
         self._clear_widgets()
         audio.play_menu_bgm()
 
-        BG      = "#04000C"
-        CARD_BG = "#0C0020"
-
-        # Full-screen backdrop so the canvas animations remain visible
-        outer = tk.Frame(self.root, bg=BG)
-        outer.place(x=0, y=0, width=_W, height=_H)
-
-        # Centered card — wider for better text alignment
-        CARD_W = min(560, int(_W * 0.75))
-        CARD_H = min(440, int(_H * 0.72))
-        card = tk.Frame(outer, bg=CARD_BG,
-                        highlightbackground="#FFD700", highlightthickness=3)
-        card.place(relx=0.5, rely=0.5, anchor="center",
-                   width=CARD_W, height=CARD_H)
-
-        # ── Animated color-cycling title canvas ──────────────────────
-        # Title pulses through MEMBER_COLORS before the game starts —
-        # gives an exciting preview feel without adding new dependencies.
-        TITLE_CV_W = CARD_W - 24; TITLE_CV_H = 68
-        title_cv = tk.Canvas(card, width=TITLE_CV_W, height=TITLE_CV_H,
-                              bg=CARD_BG, highlightthickness=0)
-        title_cv.pack(pady=(24, 0))
-
-        self._trivia_confirm_title_t = [0.0]   # mutable reference for closure
-
-        def _redraw_title():
-            """Cycle title colour through MEMBER_COLORS on every call."""
-            if not self._alive or self.screen != "trivia_confirm":
-                return
-            t2 = self._trivia_confirm_title_t[0]
-            self._trivia_confirm_title_t[0] += 0.04   # increment each frame
-
-            _tc = MEMBER_COLORS
-            phase = (t2 * 0.55) % 1.0
-            i0  = int(phase * len(_tc)) % len(_tc)
-            i1  = (i0 + 1) % len(_tc)
-            frac = (phase * len(_tc)) - i0
-            col  = blend(_tc[i0], _tc[i1], frac)
-            # Pulse alpha for a glowing breath effect
-            pulse = 0.75 + 0.25 * math.sin(t2 * 3.2)
-
-            title_cv.delete("all")
-            cx2 = TITLE_CV_W // 2; cy2 = TITLE_CV_H // 2
-            # Drop shadow for depth
-            title_cv.create_text(cx2 + 2, cy2 + 2,
-                                  text="✦  BGYO  ACES  TRIVIA  ✦",
-                                  fill=dim("#000000", 0.65),
-                                  font=(UI_FONT, 20, "bold"), anchor="center")
-            # Animated neon glow layer
-            title_cv.create_text(cx2, cy2,
-                                  text="✦  BGYO  ACES  TRIVIA  ✦",
-                                  fill=dim(col, pulse * 0.38),
-                                  font=(UI_FONT, 24, "bold"), anchor="center")
-            # Main bright text
-            title_cv.create_text(cx2, cy2,
-                                  text="✦  BGYO  ACES  TRIVIA  ✦",
-                                  fill=dim(col, pulse),
-                                  font=(UI_FONT, 20, "bold"), anchor="center")
-            # Schedule next frame — 40 ms ≈ 25 fps for this lightweight widget
-            if self._alive and self.screen == "trivia_confirm":
-                self.root.after(40, _redraw_title)
-
-        _redraw_title()   # kick off animation
-
-        # Horizontal separator with member-color segments
-        sep_cv = tk.Canvas(card, width=CARD_W - 24, height=6,
-                            bg=CARD_BG, highlightthickness=0)
-        sep_cv.pack(pady=(6, 0))
-        seg_w2 = (CARD_W - 24) // len(MEMBER_COLORS)
-        for i2, mc in enumerate(MEMBER_COLORS):
-            sep_cv.create_rectangle(i2 * seg_w2, 0, (i2 + 1) * seg_w2, 6,
-                                    fill=mc, outline="")
-
-        # ── Stat badges row — centered and aligned with the card ─────
-        badges_f = tk.Frame(card, bg=CARD_BG)
-        badges_f.pack(pady=(18, 4))
-        for badge_lbl, badge_val, badge_col in [
-            ("QUESTIONS", "12",    "#FFD700"),
-            ("TIME LIMIT", "15 s", "#00E5FF"),
-            ("TOPIC",     "BGYO",  "#FF3385"),
-        ]:
-            bc = tk.Frame(badges_f, bg="#0a0020",
-                           highlightbackground=badge_col, highlightthickness=2)
-            bc.pack(side="left", padx=10, ipadx=14, ipady=6)
-            tk.Label(bc, text=badge_lbl, bg="#0a0020", fg="#888888",
-                     font=(UI_FONT, 8, "bold")).pack()
-            tk.Label(bc, text=badge_val, bg="#0a0020", fg=badge_col,
-                     font=(MONO_FONT, 18, "bold")).pack()
-
-        # ── Centered instruction text — same width as the card content ─
-        WRAP = CARD_W - 60   # wrap slightly narrower than card for padding
-        tk.Label(card,
-                 text="Test your BGYO knowledge across Members, Songs, History & more!",
-                 bg=CARD_BG, fg="#CCCCCC",
-                 font=(UI_FONT, 12), justify="center",
-                 wraplength=WRAP).pack(pady=(14, 2))
-        tk.Label(card,
-                 text="Select your answer, then press  ✔ CONFIRM  to lock it in.",
-                 bg=CARD_BG, fg="#00E5FF",
-                 font=(UI_FONT, 11), justify="center",
-                 wraplength=WRAP).pack(pady=(2, 4))
-        tk.Label(card,
-                 text="Answer correctly and quickly — prove you're a true ACE!",
-                 bg=CARD_BG, fg=dim("#FF3385", 0.90),
-                 font=(UI_FONT, 11, "bold"), justify="center",
-                 wraplength=WRAP).pack(pady=(2, 14))
-
-        # ── Action buttons — centered and aligned with the card ───────
-        btn_frame = tk.Frame(card, bg=CARD_BG)
-        btn_frame.pack(pady=(4, 22))
-
-        # START GAME — green
-        self._pixel_btn(btn_frame, "▶  START GAME", BTN_COLORS[3],
-                        lambda: self._fade_to(self._start_trivia),
-                        width=190).pack(side="left", padx=12)
-
-        # BACK TO MAIN — pink
-        self._pixel_btn(btn_frame, "◄  MAIN STAGE", BTN_COLORS[1],
-                        lambda: self._fade_to(self._show_title),
-                        width=190).pack(side="left", padx=12)
+        # Button hit-rect storage — recalculated each frame in _draw_trivia_confirm_canvas
+        self._tc_btn_rects = {}    # "start" | "back"  →  (x1, y1, x2, y2)
+        self._tc_btn_press = None  # currently depressed button key
 
         self.screen = "trivia_confirm"
+
+    # ── Trivia confirm — fully canvas-drawn, runs every frame ────────────
+    def _draw_trivia_confirm_canvas(self, cv):
+        """
+        Per-frame canvas render for the trivia confirmation screen.
+        No tk widgets — everything is drawn directly on self.cv so the
+        star/spotlight background is always visible.
+
+        Layers (bottom → top):
+          1. Colorful smoke / stage fog rising from the screen bottom
+          2. Extra-bright star pass
+          3. Colorful per-member-color rings encircling the title
+          4. Clean rainbow title text (shadow + crisp cycling color)
+          5. Twinkling star accents below the title
+          6. Frosted card panel with cycling border
+          7. Stat badges, instruction lines, pixel buttons inside card
+        """
+        cx = _W // 2
+        t  = self.t
+
+       
+
+        # ── 2. Extra-bright star pass ────────────────────────────────────
+        for s in self.stars:
+            x  = s["nx"] * _W
+            y  = s["ny"] * _H
+            ph = s["ph"]
+            a  = 0.75 + 0.25 * abs(math.sin(t * 0.7 + ph))
+            r  = s["r"] * (1.2 + 0.5 * a)
+            cv.create_oval(x - r, y - r, x + r, y + r,
+                           fill=dim("#FFFFFF", a), outline="")
+
+        # ── Shared colour cycle ──────────────────────────────────────────
+        phase = (t * 0.50) % 1.0
+        ci0   = int(phase * len(MEMBER_COLORS)) % len(MEMBER_COLORS)
+        ci1   = (ci0 + 1) % len(MEMBER_COLORS)
+        cfrac = (phase * len(MEMBER_COLORS)) - ci0
+        col   = blend(MEMBER_COLORS[ci0], MEMBER_COLORS[ci1], cfrac)
+        pulse = 0.88 + 0.12 * math.sin(t * 2.4)
+
+        # ── Card geometry ────────────────────────────────────────────────
+        CARD_W  = min(580, int(_W * 0.70))
+        CARD_H  = min(340, int(_H * 0.54))
+        card_x1 = cx - CARD_W // 2
+        card_y1 = (_H - CARD_H) // 2 + int(_H * 0.05)
+        card_x2 = card_x1 + CARD_W
+        card_y2 = card_y1 + CARD_H
+
+        # Title floats above the card
+        TITLE_Y = card_y1 - int(_H * 0.09)
+
+        # ── 3. Colorful rings around the title ───────────────────────────
+        # Each ring uses its own MEMBER_COLOR so they form a rainbow halo.
+        # Rings breathe at slightly different rates for a living feel.
+        N_RINGS = len(MEMBER_COLORS)   # one ring per member
+        for ri in range(N_RINGS):
+            rc      = MEMBER_COLORS[ri]
+            # Spread the rings from tight to wide; inner rings are brighter
+            r_frac  = 0.12 + ri * 0.032
+            hr      = int(_W * r_frac) + int(5 * math.sin(t * 1.2 + ri * 0.7))
+            # Alternating breath speeds keep rings from moving in lockstep
+            ra      = (0.28 - ri * 0.030) * (0.65 + 0.35 * math.sin(t * 1.5 + ri * 1.3))
+            ra      = max(0.04, ra)
+            cv.create_oval(cx - hr,      TITLE_Y - hr // 4,
+                           cx + hr,      TITLE_Y + hr // 4,
+                           outline=dim(rc, ra), fill="", width=2)
+
+        # ── 4. Clean rainbow title ────────────────────────────────────────
+        title_sz  = max(44, int(_H * 0.078))
+        TITLE_TXT = "✦  BGYO  ACES  TRIVIA  ✦"
+
+        # Shadow — single small offset, dark blue tint
+        cv.create_text(cx + 2, TITLE_Y + 2, text=TITLE_TXT,
+                       fill=dim("#000033", 0.90),
+                       font=(UI_FONT, title_sz, "bold"), anchor="center")
+        # Crisp main text — smooth cycling color at full brightness
+        cv.create_text(cx, TITLE_Y, text=TITLE_TXT,
+                       fill=dim(col, pulse),
+                       font=(UI_FONT, title_sz, "bold"), anchor="center")
+
+        # ── 5. Twinkling accent stars below the title ────────────────────
+        for si in range(5):
+            sp_x = cx + (si - 2) * int(CARD_W * 0.22)
+            sp_y = TITLE_Y + int(_H * 0.038) + int(5 * math.sin(t * 1.8 + si * 1.2))
+            sp_c = MEMBER_COLORS[si % len(MEMBER_COLORS)]
+            sp_a = 0.60 + 0.40 * abs(math.sin(t * 2.2 + si))
+            sp_r = 2.5 + 1.5 * abs(math.sin(t * 3.1 + si))
+            cv.create_oval(sp_x - sp_r, sp_y - sp_r,
+                           sp_x + sp_r, sp_y + sp_r,
+                           fill=dim(sp_c, sp_a), outline="")
+
+        # ── 6. Card panel ─────────────────────────────────────────────────
+        cv.create_rectangle(card_x1 - 6, card_y1 - 6,
+                            card_x2 + 6, card_y2 + 6,
+                            fill="", outline=dim(col, pulse * 0.18), width=3)
+        cv.create_rectangle(card_x1, card_y1, card_x2, card_y2,
+                            fill="#0D0028", outline="")
+        cv.create_rectangle(card_x1, card_y1, card_x2, card_y2,
+                            fill="", outline=dim(col, pulse * 0.80), width=2)
+        cv.create_rectangle(card_x1 + 2, card_y1 + 2, card_x2 - 2, card_y1 + 3,
+                            fill=dim(col, pulse * 0.50), outline="")
+
+        # ── 7. Content layout inside card ────────────────────────────────
+        INNER_PAD  = 20
+        inner_top  = card_y1 + INNER_PAD
+        inner_bot  = card_y2 - INNER_PAD
+
+        BADGE_H    = 52
+        BTN_H2     = 42
+        badges_top = inner_top
+        btns_bot   = inner_bot
+        btns_top   = btns_bot - BTN_H2
+        lines_bot  = btns_top - 10
+        lines_top  = badges_top + BADGE_H + 12
+
+        # Stat badges
+        BADGE_DEFS = [
+            ("QUESTIONS",  "12",    "#FFD700"),
+            ("TIME LIMIT", "15 s",  "#00E5FF"),
+            ("TOPIC",      "BGYO",  "#FF3385"),
+        ]
+        BADGE_W  = 116; BADGE_GAP = 14
+        total_bw = len(BADGE_DEFS) * BADGE_W + (len(BADGE_DEFS) - 1) * BADGE_GAP
+        bx0      = cx - total_bw // 2
+
+        for bi, (blbl, bval, bcol) in enumerate(BADGE_DEFS):
+            bx1 = bx0 + bi * (BADGE_W + BADGE_GAP)
+            bx2 = bx1 + BADGE_W
+            by1 = badges_top; by2 = badges_top + BADGE_H
+            bcx = (bx1 + bx2) // 2
+            cv.create_rectangle(bx1, by1, bx2, by2, fill="#0a001e", outline="")
+            cv.create_rectangle(bx1, by1, bx2, by2, fill="", outline=bcol, width=2)
+            cv.create_text(bcx, by1 + 14, text=blbl,
+                           fill="#8888AA", font=(UI_FONT, 8, "bold"), anchor="center")
+            cv.create_text(bcx, by2 - 14, text=bval,
+                           fill=bcol, font=(MONO_FONT, 16, "bold"), anchor="center")
+
+        # Instruction lines
+        LINES = [
+            ("Test your BGYO knowledge across Members, Songs, History & more!",
+             "#CCCCCC", 11, "normal"),
+            ("Select your answer, then press  ✔ CONFIRM  to lock it in.",
+             "#00E5FF", 11, "normal"),
+            ("Answer correctly and quickly — faster time breaks leaderboard ties!",
+             "#FF3385", 10, "bold"),
+        ]
+        n_lines    = len(LINES)
+        lines_mid  = (lines_top + lines_bot) // 2
+        line_gap   = min(22, (lines_bot - lines_top) // n_lines)
+        line_start = lines_mid - (n_lines - 1) * line_gap // 2
+
+        for li, (ltxt, lcol, lsz, lweight) in enumerate(LINES):
+            cv.create_text(cx, line_start + li * line_gap,
+                           text=ltxt, fill=lcol,
+                           font=(UI_FONT, lsz, lweight),
+                           anchor="center", width=CARD_W - 48)
+
+        # Pixel-style buttons
+        BTN_W2 = 188; BTN_GAP2 = 16; HL = 4; SH = 4
+        total_btn_w = BTN_W2 * 2 + BTN_GAP2
+        sx1 = cx - total_btn_w // 2
+        sx2 = sx1 + BTN_W2
+        bk1 = sx2 + BTN_GAP2
+        bk2 = bk1 + BTN_W2
+        btn_y1 = btns_top
+        btn_y2 = btns_top + BTN_H2
+
+        self._tc_btn_rects = {
+            "start": (sx1, btn_y1, sx2, btn_y2),
+            "back":  (bk1, btn_y1, bk2, btn_y2),
+        }
+
+        for key, bx1, bx2, bcol, blabel in [
+            ("start", sx1, sx2, BTN_COLORS[3], "▶  START GAME"),
+            ("back",  bk1, bk2, BTN_COLORS[1], "◄  MAIN STAGE"),
+        ]:
+            pressed = (getattr(self, "_tc_btn_press", None) == key)
+            ox, oy  = (2, 2) if pressed else (0, 0)
+            bright  = lighten(bcol, 0.55)
+            dark    = dim(bcol, 0.40)
+            cv.create_rectangle(bx1+ox, btn_y1+oy, bx2+ox, btn_y2+oy,
+                                fill=bcol, outline="")
+            cv.create_rectangle(bx1+ox, btn_y1+oy, bx2+ox, btn_y1+oy+HL,
+                                fill=bright, outline="")
+            cv.create_rectangle(bx1+ox, btn_y2+oy-SH, bx2+ox, btn_y2+oy,
+                                fill=dark, outline="")
+            cv.create_text((bx1+bx2)//2+ox, (btn_y1+btn_y2)//2+oy,
+                           text=blabel, fill="#04000C",
+                           font=(UI_FONT, 13, "bold"), anchor="center")
 
     def _start_trivia(self):
         """Start the actual trivia game (called after confirmation)."""
@@ -1882,6 +2206,7 @@ class BGYOGame:
         self._tv_next_time   = None
         self._tv_timer_start = time.time()
         self._tv_time_limit  = 15.0
+        self._tv_time_taken  = 0.0   # reset cumulative answer-time for new session
         self.screen = "trivia"
         self._build_trivia_ui()
         self._render_trivia()
@@ -2194,6 +2519,11 @@ class BGYOGame:
         for w in c_badge.winfo_children():
             if isinstance(w, tk.Label): w.config(bg="#00FF99", fg="#003322")
         # Feedback
+        # Accumulate the seconds used on this question — capped at the time
+        # limit so a timeout doesn't penalise the player more than the max.
+        elapsed_this_q = min(time.time() - self._tv_timer_start, self._tv_time_limit)
+        self._tv_time_taken += elapsed_this_q
+
         if chosen == correct:
             self._tv_score += 1
             self._tv_fb_var.set("✦   CORRECT!   You ARE an ACE!")
@@ -2238,14 +2568,21 @@ class BGYOGame:
         tk.Label(outer, text=msg, bg="#04000C", fg=gc,
                  font=(UI_FONT, 14, "bold")).pack(pady=(0, 20))
 
+        # Total time taken this session — shown on the results screen so
+        # players can see their speed before deciding to save the score.
+        total_time_str = f"{self._tv_time_taken:.1f}s"
+
         strip = tk.Frame(outer, bg="#04000C"); strip.pack()
-        for lbl, val, vc in [("CORRECT", str(s), "#00FF99"),
-                              ("WRONG",   str(n-s), "#FF3385"),
-                              ("ACCURACY", f"{pct}%", "#00E5FF")]:
+        for lbl, val, vc in [
+            ("CORRECT",  str(s),           "#00FF99"),
+            ("WRONG",    str(n-s),         "#FF3385"),
+            ("ACCURACY", f"{pct}%",        "#00E5FF"),
+            ("TIME",     total_time_str,   "#FF8800"),   # cumulative answer time
+        ]:
             cell = tk.Frame(strip, bg="#0a0020", highlightbackground=vc, highlightthickness=2)
-            cell.pack(side="left", padx=14, ipadx=22, ipady=10)
+            cell.pack(side="left", padx=10, ipadx=18, ipady=10)
             tk.Label(cell, text=lbl, bg="#0a0020", fg="#888888", font=(UI_FONT, 9, "bold")).pack()
-            tk.Label(cell, text=val, bg="#0a0020", fg=vc,       font=(MONO_FONT, 24, "bold")).pack()
+            tk.Label(cell, text=val, bg="#0a0020", fg=vc,       font=(MONO_FONT, 20, "bold")).pack()
 
         # ── Score save section — logged-in users only; guests cannot save ─
         nf = tk.Frame(outer, bg="#04000C"); nf.pack(pady=(22, 8))
@@ -2283,10 +2620,12 @@ class BGYOGame:
             name_msg.pack()
 
             def _save_trivia():
-                # Always use the logged-in account username — name is not editable
+                # Always use the logged-in account username — name is not editable.
+                # Pass _tv_time_taken so the leaderboard can rank equal scores by speed.
                 name = session.username
                 db.save_trivia_score(name, s, n,
-                                     account_id=session.account_id)
+                                     account_id=session.account_id,
+                                     time_taken=self._tv_time_taken)
                 name_msg.config(text="✓  Score saved!", fg="#00FF99")
                 save_btn.config(state="disabled")
 
@@ -2969,7 +3308,8 @@ class BGYOGame:
             if self.screen == "title" and not session.is_guest:
                 self._logout(); return
             if self.screen in ("game", "gameover", "settings", "trivia",
-                               "pre_game", "rankings", "name_entry", "profile"):
+                               "pre_game", "rankings", "trivia_rankings",
+                               "name_entry", "profile"):
                 if self.screen == "game": self._end_game()
                 else: self._fade_to(self._show_title)
             return
@@ -3084,6 +3424,8 @@ class BGYOGame:
                     pass
         if self.screen == "pre_game":
             self._carousel_render()
+        if self.screen == "trivia_confirm":
+            self._draw_trivia_confirm_canvas(cv)
         # Transition overlay always drawn last — covers everything during fades
         self._draw_transition(dt)
 
@@ -3092,23 +3434,21 @@ class BGYOGame:
         segs = 20
         for i in range(segs):
             t2 = i / segs
-            r2 = _clamp(4  + t2 * 6)
-            b2 = _clamp(12 + t2 * 35)
+            r2 = _clamp(6  + t2 * 10)
+            b2 = _clamp(18 + t2 * 50)
             y0 = int(_H * i / segs); y1 = int(_H * (i + 1) / segs)
             cv.create_rectangle(0, y0, _W, y1, fill=f"#{r2:02x}00{b2:02x}", outline="")
         
-        # ENHANCED v18.1 FINAL: Concert lights from bgyo_game_1.py style
-        # Simple, elegant spotlights - always visible on title/game screens
+        # Concert lights — always visible on title/game screens
         for sl in self.spotlights:
             sl.draw(cv, self.t, _W, _H)
-        # ENHANCED v18.1 FINAL: Stars from bgyo_game_1.py style
-        # Simple twinkling stars - always visible
+        # Twinkling stars — always visible
         for s in self.stars:
             x  = s["nx"] * _W
             y  = s["ny"] * _H
             ph = s["ph"]
-            a  = 0.4 + 0.6 * abs(math.sin(self.t * 0.7 + ph))
-            r  = s["r"] * (0.7 + 0.3 * a)
+            a  = 0.55 + 0.45 * abs(math.sin(self.t * 0.7 + ph))
+            r  = s["r"] * (0.9 + 0.4 * a)
             cv.create_oval(x - r, y - r, x + r, y + r, 
                           fill=dim("#FFFFFF", a), outline="")
 

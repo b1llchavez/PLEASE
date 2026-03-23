@@ -363,14 +363,16 @@ def init_db():
 
     # ── trivia_scores table ───────────────────────────────────────
     # score = number of correct answers; total = questions asked.
-    # Sorted by score DESC, then played_at DESC on the leaderboard
-    # so ties show the most recent attempt first.
+    # time_taken = cumulative seconds used across all answers in the session.
+    # Sorted by score DESC, time_taken ASC, then played_at DESC so equal
+    # scores are broken by fastest total time, then most recent attempt.
     cur.execute("""CREATE TABLE IF NOT EXISTS trivia_scores(
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         account_id  INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
         player_name TEXT NOT NULL,
         score       INTEGER NOT NULL,
         total       INTEGER NOT NULL,
+        time_taken  REAL    NOT NULL DEFAULT 0.0,
         played_at   TEXT NOT NULL
     )""")
 
@@ -423,6 +425,13 @@ def init_db():
             cur.execute(f"ALTER TABLE account_settings ADD COLUMN {col_def}")
         except sqlite3.OperationalError:
             pass   # column already present — safe to ignore
+
+    # Add time_taken to trivia_scores for existing databases that
+    # predate this column — any stored score receives the default 0.0.
+    try:
+        cur.execute("ALTER TABLE trivia_scores ADD COLUMN time_taken REAL NOT NULL DEFAULT 0.0")
+    except sqlite3.OperationalError:
+        pass   # column already present — safe to ignore
 
     # ── Seed default songs ────────────────────────────────────────
     # INSERT OR IGNORE skips duplicates so re-running init_db() on an
@@ -869,11 +878,14 @@ def load_top_scores_by_difficulty(difficulty: str = "Normal",
 # ══════════════════════════════════════════════════════════════════
 
 def save_trivia_score(player_name: str, score: int, total: int,
-                      account_id=None):
+                      account_id=None, time_taken: float = 0.0):
     """
     Persist the result of one completed Aces Trivia session.
 
-    score / total : correct answers / total questions shown in that session.
+    score / total  : correct answers / total questions shown in that session.
+    time_taken     : cumulative seconds the player spent answering across all
+                     questions; stored so the leaderboard can rank equal scores
+                     by fastest total time (lower = better).
     player_name is truncated to 24 chars and defaulted to "Anonymous" if
     the caller somehow provides a blank name (shouldn't happen — the UI
     validates before calling, but this is a safety net).
@@ -889,9 +901,9 @@ def save_trivia_score(player_name: str, score: int, total: int,
         name = "Anonymous"   # safety fallback — UI should prevent blank names
     c = _conn()
     c.execute(
-        """INSERT INTO trivia_scores(account_id, player_name, score, total, played_at)
-           VALUES(?, ?, ?, ?, ?)""",
-        (account_id, name, int(score), int(total), _now())
+        """INSERT INTO trivia_scores(account_id, player_name, score, total, time_taken, played_at)
+           VALUES(?, ?, ?, ?, ?, ?)""",
+        (account_id, name, int(score), int(total), float(time_taken), _now())
     )
     c.commit()
     c.close()
@@ -900,15 +912,16 @@ def save_trivia_score(player_name: str, score: int, total: int,
 def load_trivia_scores(limit: int = 30) -> list:
     """
     Return the top `limit` trivia scores across all players, ordered
-    by score DESC then played_at DESC (most recent result wins ties).
+    by score DESC, then time_taken ASC (fastest time breaks ties),
+    then played_at DESC (most recent result wins remaining ties).
 
-    Called by bgyo_game._show_leaderboard() for the Trivia tab.
+    Called by bgyo_game._show_trivia_rankings() for the leaderboard table.
     """
     c = _conn()
     try:
         rows = c.execute(
             """SELECT * FROM trivia_scores
-               ORDER BY score DESC, played_at DESC
+               ORDER BY score DESC, time_taken ASC, played_at DESC
                LIMIT ?""",
             (limit,)
         ).fetchall()
@@ -920,7 +933,8 @@ def load_trivia_scores(limit: int = 30) -> list:
 def load_trivia_scores_for_account(account_id: int, limit: int = 20) -> list:
     """
     Return the top `limit` trivia scores for a specific account,
-    ordered by score DESC then played_at DESC.
+    ordered by score DESC, then time_taken ASC (fastest time breaks
+    ties), then played_at DESC.
 
     Used by bgyo_game to display a player's personal trivia history
     on the profile or result screen.
@@ -930,7 +944,7 @@ def load_trivia_scores_for_account(account_id: int, limit: int = 20) -> list:
         rows = c.execute(
             """SELECT * FROM trivia_scores
                WHERE account_id=?
-               ORDER BY score DESC, played_at DESC
+               ORDER BY score DESC, time_taken ASC, played_at DESC
                LIMIT ?""",
             (account_id, limit)
         ).fetchall()
