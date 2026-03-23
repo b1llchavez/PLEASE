@@ -1020,11 +1020,23 @@ def draw_hud(cv, gs: dict, t: float, cfg,
                    width=text_area_w)
 
     # Status indicator — analysing / playing / no audio
-    bm_col, bm_txt = (
-        ("#FF8800", "⟳ ANALYSING") if gs.get("loading") else
-        ("#00E5FF", "♪ PLAYING")    if gs.get("song_wall_start") else
-        ("#555555", "◌ NO AUDIO")
-    )
+    # In endless/shuffle mode show song progress counter
+    if gs.get("endless"):
+        done    = gs.get("songs_played", 0)
+        total   = gs.get("max_songs", 25)
+        cur_num = min(done + 1, total)
+        if gs.get("loading"):
+            bm_col, bm_txt = "#FF8800", f"⟳ LOADING  {cur_num}/{total}  ENDLESS"
+        elif gs.get("song_wall_start"):
+            bm_col, bm_txt = "#FFD700", f"♾ SONG {cur_num} / {total}  ENDLESS SHUFFLED"
+        else:
+            bm_col, bm_txt = "#555555", f"◌ SONG {cur_num}/{total}  ENDLESS"
+    else:
+        bm_col, bm_txt = (
+            ("#FF8800", "⟳ ANALYSING") if gs.get("loading") else
+            ("#00E5FF", "♪ PLAYING")    if gs.get("song_wall_start") else
+            ("#555555", "◌ NO AUDIO")
+        )
     cv.create_text(text_area_cx, 58, text=bm_txt, fill=bm_col,
                    font=(UI_FONT, 8, "bold"), anchor="center")
 

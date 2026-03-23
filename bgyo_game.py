@@ -2722,14 +2722,21 @@ class BGYOGame:
         playable = get_all_playable_songs(cfg.songs)
 
         # Build ordered song list and path map
+        MAX_SHUFFLE = 25
         if cfg.selected_mode == "shuffle":
             if playable:
                 random.shuffle(playable)
-                song_names = [n for n, _ in playable]
-                song_paths = {n: p for n, p in playable}
+                all_names  = [n for n, _ in playable]
+                all_paths  = {n: p for n, p in playable}
+                # Cycle if fewer than MAX_SHUFFLE songs available
+                import itertools
+                song_names = list(itertools.islice(itertools.cycle(all_names), MAX_SHUFFLE))
+                song_paths = all_paths
             else:
-                sl = list(cfg.songs); random.shuffle(sl)
-                song_names = sl; song_paths = {}
+                sl = list(cfg.songs)
+                random.shuffle(sl)
+                song_names = sl[:MAX_SHUFFLE] if sl else []
+                song_paths = {}
             is_endless = True
         else:
             song_names = [cfg.selected_song]
@@ -2742,6 +2749,9 @@ class BGYOGame:
             song_names, song_paths, is_endless,
             num_lanes, cfg.difficulty
         )
+        # Endless-mode progress counters
+        self.gs["songs_played"] = 0
+        self.gs["max_songs"]    = MAX_SHUFFLE if is_endless else 1
         self._game_volume = cfg.music_volume
         self.screen       = "game"
         self._build_ingame_overlay_btn()
@@ -2977,9 +2987,26 @@ class BGYOGame:
     def _advance_song(self):
         gs = self.gs
         if gs.get("ended") or gs.get("advancing"): return
-        gs["advancing"]       = True
+        gs["advancing"] = True
         audio.stop()
-        gs["song_idx"]        = (gs["song_idx"] + 1) % max(1, len(gs["song_names"]))
+
+        # Count completed songs; end after max_songs in endless mode
+        gs["songs_played"] = gs.get("songs_played", 0) + 1
+        if gs.get("endless") and gs["songs_played"] >= gs.get("max_songs", 25):
+            gs["ended"] = True
+            self._close_ingame_overlay()
+            self._fade_to(self._show_name_entry)
+            return
+
+        # Move to next song; end if we've run out of entries
+        next_idx = gs["song_idx"] + 1
+        if next_idx >= len(gs["song_names"]):
+            gs["ended"] = True
+            self._close_ingame_overlay()
+            self._fade_to(self._show_name_entry)
+            return
+
+        gs["song_idx"]        = next_idx
         gs["beat_chart"]      = []; gs["chart_cursor"] = 0
         gs["beat_mode"]       = False; gs["loading"]   = False
         gs["song_wall_start"] = None; gs["song_duration"] = None
@@ -3065,6 +3092,10 @@ class BGYOGame:
 
         def submit():
             name = session.username   # always use account username
+            if gs.get("endless"):
+                display_song = "ENDLESS (SHUFFLED)"
+            else:
+                display_song = gs["song_names"][gs["song_idx"] % max(1, len(gs["song_names"]))]
             db.save_score(
                 player_name = name,
                 score       = gs["score"],
@@ -3072,7 +3103,7 @@ class BGYOGame:
                 max_combo   = gs["max_combo"],
                 grade       = rank,
                 difficulty  = cfg.difficulty,
-                song_name   = gs["song_names"][gs["song_idx"] % max(1, len(gs["song_names"]))],
+                song_name   = display_song,
                 account_id  = session.account_id,
             )
             msg_lbl.config(text="✓  Score saved!", fg="#00FF99")
@@ -3466,7 +3497,10 @@ class BGYOGame:
             _W, _H, _project, _HIT_DEPTH
         )
         # Song-end flag set by update_game when audio.is_busy() → False
+        # Must clear advancing BEFORE calling _advance_song, because
+        # _advance_song has "if gs.get('advancing'): return" as its guard.
         if self.gs.get("advancing") and not self.gs.get("ended"):
+            self.gs["advancing"] = False
             if self.gs["endless"]:
                 self._advance_song()
             else:
