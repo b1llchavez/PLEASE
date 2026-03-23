@@ -1,38 +1,3 @@
-"""
-╔══════════════════════════════════════════════════════════════════╗
-║   BGYO: THE LIGHT STAGE — ACES OF P-POP  v18.0                 ║
-║   constants.py  ·  Shared constants, colour helpers, projection ║
-╚══════════════════════════════════════════════════════════════════╝
-
-PURPOSE & ROLE IN THE ARCHITECTURE
-────────────────────────────────────
-This is the single source of truth for every value that needs to be
-shared across the codebase.  No other module defines game-wide
-tuning values or colour helpers — they all import from here.
-
-Dependency graph (constants.py sits at the root):
-
-    constants.py
-        ↑ imported by ALL other modules:
-        │  audio_engine.py   — reads SONGS_DIR, HIT_DEPTH, MIN_BEAT_GAP,
-        │                       MASTER_VOLUME, effective_music_volume()
-        │  game_objects.py   — reads MEMBER_COLORS, BG_COL, W, H,
-        │                       dim/blend/additive_blend/spotlight_col
-        │  file_helpers.py   — reads SONGS_DIR, PREVIEW_DIR, COVERS_DIR
-        │  settings_state.py — reads/writes MASTER_VOLUME, MUSIC_VOLUME,
-        │                       SFX_VOLUME, SFX_INTENSITY, SFX_ENABLED
-        │  database.py       — (no constants imports)
-        └  bgyo_game.py      — reads almost everything
-
-MUTABLE GLOBALS (the "global state bus")
-──────────────────────────────────────────
-MASTER_VOLUME, MUSIC_VOLUME, SFX_VOLUME, SFX_INTENSITY, SFX_ENABLED
-are intentionally mutable module-level names.  settings_state.apply()
-writes them whenever the player changes a slider, and audio_engine /
-game_objects read them on every frame — giving real-time, zero-restart
-volume and effect updates without circular imports between those modules.
-"""
-
 import os, math
 
 
