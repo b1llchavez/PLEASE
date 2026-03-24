@@ -77,7 +77,9 @@ def draw_track(cv, t: float, combo: int, num_lanes: int,
         bgyo_game._draw_stage()  — before notes and particles.
     """
     brightness = min(1.0, 0.55 + combo * 0.012)
-    grid_steps = 28
+    # Reduced from 28 to 22 horizontal rows — the perspective grid remains
+    # visually convincing while cutting the line draw calls by ~21%.
+    grid_steps = 22
 
     # ── Horizontal depth lines ────────────────────────────────────
     for i in range(grid_steps):
@@ -218,12 +220,12 @@ def draw_notes(cv, notes: list, t: float, num_lanes: int,
         r   = sc * 27   # base radius scales with depth (closer = larger)
         col = MEMBER_COLORS[n.lane % len(MEMBER_COLORS)]
 
-        # Layer 1 — soft glow halos (2 passes)
-        for gi in range(2):
-            gr = r * (1.5 - gi * 0.25)    # shrinking glow radius
-            a  = max(0.0, 0.14 - gi * 0.05)  # dimming glow alpha
-            cv.create_oval(px - gr, py - gr, px + gr, py + gr,
-                           fill=dim(col, a), outline="")
+        # Layer 1 — soft glow halo (1 pass, reduced from 2 for performance).
+        # A single outer halo at r×1.5 retains the bloom feel while halving
+        # the oval draw calls on dense ACE beat sections.
+        gr = r * 1.5
+        cv.create_oval(px - gr, py - gr, px + gr, py + gr,
+                       fill=dim(col, 0.13), outline="")
 
         # Layer 2 — main note body: solid fill + white outline
         cv.create_oval(px - r, py - r, px + r, py + r,
@@ -235,11 +237,13 @@ def draw_notes(cv, notes: list, t: float, num_lanes: int,
                        px + r * 0.12, py + r * 0.12 - r * 0.14,
                        fill="#ffffff", outline="")
 
-        # Layer 4 — approach sparkles (only within 35% of the hit bar)
+        # Layer 4 — approach sparkles (only within 35% of the hit bar).
+        # Reduced from 3 to 2 orbiting dots for performance; the approach
+        # warning is still clearly visible with two dots.
         if n.depth > 0.65:
-            for si in range(3):
-                # Evenly spaced at 2π/3 apart, rotating at 4.0 rad/s
-                ang = t * 4.0 + si * (2 * math.pi / 3)
+            for si in range(2):
+                # Two dots spaced π apart, rotating at 4.0 rad/s
+                ang = t * 4.0 + si * math.pi
                 sx_ = px + math.cos(ang) * r * 1.35
                 sy_ = py + math.sin(ang) * r * 1.35
                 cv.create_oval(sx_ - 2, sy_ - 2, sx_ + 2, sy_ + 2,

@@ -1,6 +1,16 @@
 import tkinter as tk
 import math, random, time, os, threading
 
+# ── Cross-platform DPI awareness (Windows) ────────────────────────
+# Must be called before any tkinter window is created.  Declaring
+# DPI awareness here prevents Windows from bitmap-scaling the window,
+# which would blur the canvas and shift widget positions.
+try:
+    import ctypes
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)   # Per-monitor DPI aware
+except Exception:
+    pass   # Non-Windows or ctypes unavailable — silently skip
+
 # ── Optional libraries ────────────────────────────────────────────
 try:
     from PIL import Image, ImageTk, ImageDraw
@@ -22,6 +32,8 @@ from constants import (
     additive_blend, spotlight_col,
     project, VPX, VPY, SW, SL, NEARY, HIT_DEPTH,
     lane_cx,
+    # DPI-aware font-size helper — returns point sizes scaled for Windows
+    _fs,
 )
 import database as db
 from database import AccountError
@@ -68,11 +80,15 @@ from ui_helpers import (
     make_themed_btn_row,      # palette-cycling button row
     make_section_label,       # horizontal rule + label divider
     draw_fancy_title,         # neon "BGYO" + subtitle canvas widget
+    get_title_cycle_color,    # derives animated colour for the BGYO title
     update_neon_border,       # animated cycling glow border
+    center_window,            # centres any Toplevel on the user's screen
     draw_star5,               # 5-pointed star polygon
     draw_ellipse_glow,        # concentric soft radial glow
     draw_transition_overlay,  # full-screen white fade overlay
     play_click,               # synthesised click sound
+    make_entry,               # cross-platform Entry with overridden OS defaults
+    make_scale,               # cross-platform Scale with overridden OS defaults
 )
 
 # ── Projection globals (updated on fullscreen toggle) ─────────────
@@ -101,16 +117,44 @@ class BGYOGame:
         self.root.title("The Light Stage: Aces of P-Pop  v18.5")
         self.root.resizable(False, False)
         self.root.configure(bg=BG_COL)
+        # Pre-set tkinter's option database so new widgets default to
+        # the game background — prevents the white/grey flicker on Windows
+        # before individual widget bg= properties take effect.
+        self.root.option_add("*Background",    BG_COL)
+        self.root.option_add("*background",    BG_COL)
+        self.root.option_add("*Foreground",    "#FFFFFF")
+        self.root.option_add("*foreground",    "#FFFFFF")
+        self.root.option_add("*BorderWidth",   0)
+        self.root.option_add("*Relief",        "flat")
+
+        # Suppress Windows high-DPI auto-scaling that would resize the window
+        # beyond the designed BASE_W × BASE_H canvas dimensions.
+        try:
+            self.root.tk.call("tk", "scaling", 1.0)
+        except Exception:
+            pass
 
         self.cv = tk.Canvas(self.root, width=W, height=H,
                             bg=BG_COL, highlightthickness=0)
         self.cv.pack()
 
+        # Center the main window on the user's screen at startup
+        self.root.update_idletasks()
+        _sw = self.root.winfo_screenwidth()
+        _sh = self.root.winfo_screenheight()
+        _wx = (_sw - W) // 2
+        _wy = (_sh - H) // 2
+        self.root.geometry(f"{W}x{H}+{_wx}+{_wy}")
+
         # ── Time / animation ──────────────────────────────────────────
         self.t      = 0.0
         self.last_t = time.time()
         self.screen = "login"
-        self._title_canvas = None  # For animated title in login/register screens
+        # Reference to the live Canvas widget drawn by draw_fancy_title().
+        # Rebuilt on each _show_login / _show_register call; the loop calls
+        # _update_title_color() each frame to repaint the animated top layer.
+        self._title_canvas = None
+        self._title_color  = "#00E5FF"  # current animated colour for BGYO
 
         # ── Scene objects ─────────────────────────────────────────────
         self.stars = [
@@ -191,10 +235,20 @@ class BGYOGame:
         self._loop()
         self.root.mainloop()
 
-    # ── Fullscreen ───────────────────────────────────────────────────
     def _apply_fullscreen(self):
         global _W, _H, _project, _HIT_DEPTH
+        # Always commit the window geometry and flush pending events first so
+        # that screen dimension queries are accurate on all platforms.
+        self.root.update_idletasks()
+        _sw = self.root.winfo_screenwidth()
+        _sh = self.root.winfo_screenheight()
         if cfg.fullscreen:
+            # Centre the window at base size before applying fullscreen so the
+            # OS transition starts from the correct position on every platform.
+            _wx = (_sw - BASE_W) // 2
+            _wy = (_sh - BASE_H) // 2
+            self.root.geometry(f"{BASE_W}x{BASE_H}+{_wx}+{_wy}")
+            self.root.update_idletasks()
             self.root.attributes("-fullscreen", True)
             self.root.update_idletasks()
             _W = self.root.winfo_screenwidth()
@@ -202,8 +256,13 @@ class BGYOGame:
         else:
             self.root.attributes("-fullscreen", False)
             _W, _H = BASE_W, BASE_H
+            # Re-centre the window whenever it switches to windowed mode
+            _wx = (_sw - _W) // 2
+            _wy = (_sh - _H) // 2
+            self.root.geometry(f"{_W}x{_H}+{_wx}+{_wy}")
         self.cv.config(width=_W, height=_H)
-        self.root.geometry(f"{_W}x{_H}")
+        if cfg.fullscreen:
+            self.root.geometry(f"{_W}x{_H}")
         from constants import _make_proj
         _project, *_, _HIT_DEPTH = _make_proj(_W, _H)
         self.stars = [
@@ -315,7 +374,66 @@ class BGYOGame:
 
     # ── Lifecycle ─────────────────────────────────────────────────────
     def _on_close(self):
-        self._alive = False          # signal the loop to stop scheduling
+        """Show a friendly exit-confirmation dialog before closing the game."""
+        # If a confirmation dialog is already open, don't stack another one
+        if getattr(self, "_exit_dialog_open", False):
+            return
+        self._exit_dialog_open = True
+
+        CARD = "#04000C"
+        dlg  = tk.Toplevel(self.root)
+        dlg.title("Exit Game")
+        dlg.configure(bg=CARD)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.attributes("-topmost", True)
+        # Outer glow border
+        border = tk.Frame(dlg, bg="#FF3385", padx=2, pady=2)
+        border.pack(fill="both", expand=True)
+        inner = tk.Frame(border, bg=CARD)
+        inner.pack(fill="both", expand=True)
+
+        tk.Label(inner, text="✕  EXIT THE LIGHT STAGE?",
+                 bg=CARD, fg="#FF3385",
+                 font=(UI_FONT, _fs(16), "bold")).pack(pady=(12, 4))
+        tk.Label(inner,
+                 text="Are you sure you want to leave?\nSee you soon, Ace! ★",
+                 bg=CARD, fg="#CCCCCC",
+                 font=(UI_FONT, _fs(11)), justify="center").pack(pady=(0, 10))
+
+        btn_f = tk.Frame(inner, bg=CARD); btn_f.pack(pady=(0, 12))
+
+        # Center after packing so the window fits its content tightly
+        center_window(dlg, 380, 170)
+
+        def _confirm_exit():
+            dlg.destroy()
+            self._alive = False
+            try:
+                audio.stop()
+                audio.stop_preview()
+            except Exception:
+                pass
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+
+        def _cancel_exit():
+            self._exit_dialog_open = False
+            dlg.destroy()
+
+        # Handle the dialog's own X button as a cancel
+        dlg.protocol("WM_DELETE_WINDOW", _cancel_exit)
+
+        self._pixel_btn(btn_f, "✕  YES, EXIT", BTN_COLORS[5],
+                        _confirm_exit, width=160).pack(side="left", padx=10)
+        self._pixel_btn(btn_f, "★  NO, STAY!", BTN_COLORS[0],
+                        _cancel_exit,  width=160).pack(side="left", padx=10)
+
+    def _force_close(self):
+        """Immediate shutdown — used internally (e.g. from the exit dialog itself)."""
+        self._alive = False
         try:
             audio.stop()
             audio.stop_preview()
@@ -389,12 +507,51 @@ class BGYOGame:
     # ═══════════════════════════════════════════════════════════════
     #  AUTH SCREENS — Login / Register
     # ═══════════════════════════════════════════════════════════════
-    def _draw_fancy_title(self, parent, bg=BG_COL):
+    def _draw_fancy_title(self, parent, bg=None):
         """
         Draw the neon 'BGYO' title and subtitle inside parent.
-        Delegates to ui_helpers.draw_fancy_title().
+        bg defaults to the parent widget's own background so the Canvas is
+        visually transparent — no black box shows behind the text.
         """
-        draw_fancy_title(parent, bg)
+        # Inherit parent colour so there is no visible canvas background box
+        _bg = bg if bg is not None else parent.cget("bg")
+        self._title_canvas = draw_fancy_title(parent, _bg,
+                                              title_color=self._title_color)
+
+    def _update_title_color(self):
+        """
+        Repaints only the animated top colour layer of the BGYO title Canvas.
+        Throttled to every 3rd frame — the colour cycle is slow enough that
+        skipping frames saves Canvas calls with no visible stuttering.
+        """
+        if not hasattr(self, "_title_color_ctr"):
+            self._title_color_ctr = 0
+        self._title_color_ctr += 1
+        if self._title_color_ctr % 3 != 0:
+            return
+
+        if self._title_canvas is None:
+            return
+        try:
+            if not self._title_canvas.winfo_exists():
+                self._title_canvas = None
+                return
+        except Exception:
+            self._title_canvas = None
+            return
+
+        new_col = get_title_cycle_color(self.t)
+        if new_col == self._title_color:
+            return
+        self._title_color = new_col
+
+        # Redraw only the top animated layer — shadow stack is untouched
+        self._title_canvas.delete("title_anim")
+        _top_col = blend("#FFD700", new_col, 0.60)
+        self._title_canvas.create_text(
+            240, 40, text="BGYO", fill=_top_col,
+            font=(TITLE_FONT, _fs(58), "bold"), anchor="center", tags="title_anim"
+        )
 
     def _show_login(self):
         self._clear_widgets(); self.screen = "login"
@@ -405,7 +562,11 @@ class BGYOGame:
         outer.place(relx=0.5, rely=0.5, anchor="center")
 
         # ── SINGLE UNIFIED CONTAINER: Title + Login Form ────────────
-        container = tk.Frame(outer, bg="#0a0018")
+        # ipadx/ipady use fixed pixel values to retain macOS dimensions.
+        # highlightthickness=2 is required on Windows — the OS resets it to 0
+        # for plain Frames unless stated explicitly here and on every update.
+        container = tk.Frame(outer, bg="#0a0018",
+                             highlightbackground="#FFD700", highlightthickness=2)
         container.pack(ipadx=min(30, int(_W*0.025)), ipady=16)
         
         # Store reference for border animation
@@ -414,44 +575,36 @@ class BGYOGame:
         # Draw title inside the container
         self._draw_fancy_title(container)
 
-        # Draw login form inside the same container
+        # DPI-adjusted font keeps the label text the same visual size on Windows
         tk.Label(container, text="▶  PLAYER LOGIN", bg="#0a0018", fg="#FFD700",
-                 font=(UI_FONT, 16, "bold")).pack(pady=(0, 16))
+                 font=(UI_FONT, _fs(16), "bold")).pack(pady=(0, 16))
 
-        # ── Centered input fields with uniform sizing ────
+        # ── Centered input fields — explicit width in characters ────
+        # width=22 chars is the macOS design value; tk.Entry character
+        # width is font-relative so it remains consistent when _fs() is applied.
         INPUT_WIDTH = 22
         
-        # Username field (centered)
         uf = tk.Frame(container, bg="#0a0018"); uf.pack(pady=8)
         tk.Label(uf, text="USERNAME", bg="#0a0018", fg="#888888",
-                 font=(UI_FONT, 9, "bold")).pack(pady=(0, 4))
+                 font=(UI_FONT, _fs(9), "bold")).pack(pady=(0, 4))
         user_var = tk.StringVar()
-        user_e   = tk.Entry(uf, textvariable=user_var, bg="#0c0022", fg="#FFFFFF",
-                            insertbackground="#FFD700", font=(UI_FONT, 13, "bold"),
-                            relief="flat", width=INPUT_WIDTH,
-                            highlightthickness=2,
-                            highlightbackground="#334466",
-                            highlightcolor="#FFD700")
+        user_e   = make_entry(uf, user_var, width=INPUT_WIDTH,
+                              highlight_color="#FFD700")
         user_e.pack()
         user_e.focus_set()
 
-        # Password field (centered, same size as username)
         pf = tk.Frame(container, bg="#0a0018"); pf.pack(pady=8)
         tk.Label(pf, text="PASSWORD", bg="#0a0018", fg="#888888",
-                 font=(UI_FONT, 9, "bold")).pack(pady=(0, 4))
+                 font=(UI_FONT, _fs(9), "bold")).pack(pady=(0, 4))
         pass_var = tk.StringVar()
-        pass_e   = tk.Entry(pf, textvariable=pass_var, show="●", bg="#0c0022", fg="#FFFFFF",
-                            insertbackground="#FFD700", font=(UI_FONT, 13, "bold"),
-                            relief="flat", width=INPUT_WIDTH,
-                            highlightthickness=2,
-                            highlightbackground="#334466",
-                            highlightcolor="#FFD700")
+        pass_e   = make_entry(pf, pass_var, show="●", width=INPUT_WIDTH,
+                              highlight_color="#FFD700")
         pass_e.pack()
 
         # Message label
         msg_var = tk.StringVar()
         msg_lbl = tk.Label(container, textvariable=msg_var, bg="#0a0018", fg="#FF3385",
-                           font=(UI_FONT, 10, "bold"), wraplength=380)
+                           font=(UI_FONT, _fs(10), "bold"), wraplength=380)
         msg_lbl.pack(pady=(10, 4))
 
         def do_login():
@@ -491,7 +644,7 @@ class BGYOGame:
                 cv_btn.create_rectangle(x1+ox, y1+oy, x2+ox, y1+oy+HL, fill=bright, outline="")
                 cv_btn.create_rectangle(x1+ox, y2+oy-SH, x2+ox, y2+oy, fill=dark, outline="")
                 cv_btn.create_text(bw//2+ox, BTN_H_PX//2+oy, text=label,
-                                   fill="#04000C", font=(UI_FONT, 13, "bold"), anchor="center")
+                                   fill="#04000C", font=(UI_FONT, _fs(13), "bold"), anchor="center")
 
             def _press(e):
                 pressed[0] = True; _draw(True)
@@ -514,10 +667,11 @@ class BGYOGame:
         _make_pixel_btn(bf, "★  REGISTER", BTN_COLORS[2],
                         lambda: self._fade_to(self._show_register), width=BTN_W).pack(side="left", padx=(GAP//2, 4))
 
-        # Guest play button — full width below
+        # Guest play button — ♟ (pawn/person silhouette) matches the single-char
+        # icon style of ▶ ★ ✕ ⚙ ◆ used on every other button in the game.
         guest_w = BTN_W * 2 + GAP
         gf = tk.Frame(container, bg="#0a0018"); gf.pack(pady=(0, 4))
-        _make_pixel_btn(gf, "◉  PLAY AS GUEST", BTN_COLORS[4],
+        _make_pixel_btn(gf, "♟  PLAY AS GUEST", BTN_COLORS[4],
                         self._confirm_guest_play,
                         width=guest_w).pack()
 
@@ -538,8 +692,10 @@ class BGYOGame:
         outer.place(relx=0.5, rely=0.5, anchor="center")
 
         # ── SINGLE UNIFIED CONTAINER: Title + Register Form ────────
-        # This will be wrapped with animated glowing border
-        container = tk.Frame(outer, bg="#0a0018")
+        # This will be wrapped with animated glowing border.
+        # highlightthickness=2 must be stated here; Windows resets it to 0.
+        container = tk.Frame(outer, bg="#0a0018",
+                             highlightbackground="#FFD700", highlightthickness=2)
         container.pack(ipadx=30, ipady=18)
         
         # Store reference for border animation
@@ -550,7 +706,7 @@ class BGYOGame:
 
         # Draw register form inside the same container
         tk.Label(container, text="★  CREATE ACCOUNT", bg="#0a0018", fg="#00E5FF",
-                 font=(UI_FONT, 16, "bold")).pack(pady=(0, 16))
+                 font=(UI_FONT, _fs(16), "bold")).pack(pady=(0, 16))
 
         # ── Centered input fields with uniform sizing ────
         INPUT_WIDTH = 22
@@ -559,15 +715,12 @@ class BGYOGame:
         for lbl_text, var_name, show_ch in fields:
             rf = tk.Frame(container, bg="#0a0018"); rf.pack(pady=8)
             tk.Label(rf, text=lbl_text, bg="#0a0018", fg="#888888",
-                     font=(UI_FONT, 9, "bold")).pack(pady=(0, 4))
+                     font=(UI_FONT, _fs(9), "bold")).pack(pady=(0, 4))
             v = tk.StringVar(); setattr(container, var_name, v)
-            e = tk.Entry(rf, textvariable=v, show=show_ch,
-                         bg="#0c0022", fg="#FFFFFF",
-                         insertbackground="#00E5FF", font=(UI_FONT, 13, "bold"),
-                         relief="flat", width=INPUT_WIDTH,
-                         highlightthickness=2,
-                         highlightbackground="#334466",
-                         highlightcolor="#00E5FF")
+            # make_entry() overrides Windows-default entry styling
+            e = make_entry(rf, v, show=show_ch, width=INPUT_WIDTH,
+                           highlight_color="#00E5FF",
+                           insert_bg="#00E5FF")
             e.pack()
             entry_map[var_name] = e
             if lbl_text == "USERNAME":
@@ -575,11 +728,11 @@ class BGYOGame:
 
         tk.Label(container,
                  text="Username: 3-24 chars  •  Password: 6+ chars",
-                 bg="#0a0018", fg="#445566", font=(UI_FONT, 8)).pack(pady=(6, 0))
+                 bg="#0a0018", fg="#445566", font=(UI_FONT, _fs(8))).pack(pady=(6, 0))
 
         msg_var = tk.StringVar()
         msg_lbl = tk.Label(container, textvariable=msg_var, bg="#0a0018",
-                           font=(UI_FONT, 10, "bold"), wraplength=380)
+                           font=(UI_FONT, _fs(10), "bold"), wraplength=380)
         msg_lbl.pack(pady=(10, 4))
 
         def do_register():
@@ -622,7 +775,7 @@ class BGYOGame:
                 cv_btn.create_rectangle(x1+ox, y1+oy, x2+ox, y1+oy+4, fill=bright, outline="")
                 cv_btn.create_rectangle(x1+ox, y2+oy-4, x2+ox, y2+oy, fill=dark, outline="")
                 cv_btn.create_text(bw//2+ox, C.BTN_H//2+oy, text=label,
-                                   fill="#04000C", font=(UI_FONT, 13, "bold"), anchor="center")
+                                   fill="#04000C", font=(UI_FONT, _fs(13), "bold"), anchor="center")
 
             def _press(e):
                 pressed[0] = True; _draw(True)
@@ -654,13 +807,15 @@ class BGYOGame:
             e.bind("<Return>", lambda ev: do_register())
 
     def _update_login_container_border(self):
-        """Animate neon glow border on login/register form — delegates to ui_helpers."""
+        """Animate the neon glow border on login/register form container."""
         if not hasattr(self, '_login_container') or not self._login_container:
             return
         try:
-            update_neon_border(self._login_container, self.t)
+            # speed=0.45 gives a slightly brisker cycle than the default 0.35
+            update_neon_border(self._login_container, self.t, speed=0.45)
         except Exception:
             pass
+
 
     def _confirm_guest_play(self):
         """Show a modal warning that guest scores are not saved, then proceed."""
@@ -669,31 +824,28 @@ class BGYOGame:
         modal.title("")
         modal.configure(bg=CARD)
         modal.resizable(False, False)
-        modal.grab_set()   # block interaction with main window
-        modal.transient(self.root)
-
-        # Centre over root
-        modal.update_idletasks()
-        mw, mh = 460, 260
-        rx = self.root.winfo_rootx() + (_W - mw) // 2
-        ry = self.root.winfo_rooty() + (_H - mh) // 2
-        modal.geometry(f"{mw}x{mh}+{rx}+{ry}")
+        # NOTE: Do NOT call modal.transient(self.root) here.
+        # On Windows, transient() makes the OS position the dialog
+        # relative to the parent window, overriding any geometry() call
+        # and placing it in the upper-left corner.  grab_set() alone is
+        # sufficient to block interaction with the parent.
+        modal.grab_set()
         modal.attributes("-topmost", True)
 
         # Border frame
         border = tk.Frame(modal, bg="#FF8800", padx=2, pady=2)
         border.pack(fill="both", expand=True)
-        inner = tk.Frame(border, bg=CARD)
+        inner = tk.Frame(border, bg=CARD, highlightthickness=0)
         inner.pack(fill="both", expand=True)
 
-        tk.Label(inner, text="◉  PLAY AS GUEST", bg=CARD, fg="#FF8800",
-                 font=(UI_FONT, 16, "bold")).pack(pady=(20, 6))
+        tk.Label(inner, text="♟  PLAY AS GUEST", bg=CARD, fg="#FF8800",
+                 font=(UI_FONT, _fs(16), "bold")).pack(pady=(14, 4))
 
         tk.Label(inner,
                  text="Your game scores will NOT be saved\nto the leaderboard as a Guest.\n\nRegister a free account to keep your scores!",
-                 bg=CARD, fg="#CCCCCC", font=(UI_FONT, 11), justify="center").pack(pady=(0, 18))
+                 bg=CARD, fg="#CCCCCC", font=(UI_FONT, _fs(11)), justify="center").pack(pady=(0, 10))
 
-        btn_f = tk.Frame(inner, bg=CARD); btn_f.pack(pady=(0, 18))
+        btn_f = tk.Frame(inner, bg=CARD); btn_f.pack(pady=(0, 12))
 
         def _proceed():
             modal.destroy()
@@ -709,6 +861,9 @@ class BGYOGame:
                         _proceed, width=200).pack(side="left", padx=8)
         self._pixel_btn(btn_f, "★  REGISTER", BTN_COLORS[2],
                         _go_register, width=120).pack(side="left", padx=8)
+
+        # Center AFTER all widgets are packed so the window fits its content.
+        center_window(modal, 420, 220)
 
     def _logout(self):
         audio.stop_bgm()
@@ -736,7 +891,7 @@ class BGYOGame:
             # Store reference so the loop can animate the border
             self._badge_frame = badge
             tk.Label(badge, text=f"★  {session.username.upper()}", bg="#0a0018", fg="#FFD700",
-                     font=(UI_FONT, 10, "bold")).pack(side="left", padx=(10, 4), pady=6)
+                     font=(UI_FONT, _fs(10), "bold")).pack(side="left", padx=(10, 4), pady=6)
         # Colorful pixel-style LOGOUT button
             _lo_col = BTN_COLORS[1]  # pink
             _lo_w, _lo_h = 90, 30
@@ -753,7 +908,7 @@ class BGYOGame:
                 lo_cv.create_rectangle(ox, _lo_h+oy-3, _lo_w+ox, _lo_h+oy,
                                        fill=dim(_lo_col, 0.40), outline="")
                 lo_cv.create_text(_lo_w//2+ox, _lo_h//2+oy, text="LOGOUT",
-                                  fill="#000000", font=(UI_FONT, 9, "bold"),
+                                  fill="#000000", font=(UI_FONT, _fs(9), "bold"),
                                   anchor="center")
             _lo_pressed = [False]
             def _lo_press(e):  _lo_pressed[0]=True;  _draw_lo(True)
@@ -783,7 +938,7 @@ class BGYOGame:
                 pr_cv.create_rectangle(ox, _pr_h+oy-3, _pr_w+ox, _pr_h+oy,
                                        fill=dim(_pr_col, 0.40), outline="")
                 pr_cv.create_text(_pr_w//2+ox, _pr_h//2+oy, text="MY PROFILE",
-                                  fill="#000000", font=(UI_FONT, 9, "bold"),
+                                  fill="#000000", font=(UI_FONT, _fs(9), "bold"),
                                   anchor="center")
             _pr_pressed = [False]
             def _pr_press(e):  _pr_pressed[0]=True;  _draw_pr(True)
@@ -803,7 +958,7 @@ class BGYOGame:
                                    highlightbackground="#FF8800", highlightthickness=2)
             guest_badge.place(x=12, y=12)
             tk.Label(guest_badge, text="👤  GUEST", bg="#0a0018", fg="#FF8800",
-                     font=(UI_FONT, 10, "bold")).pack(side="left", padx=(10, 4), pady=6)
+                     font=(UI_FONT, _fs(10), "bold")).pack(side="left", padx=(10, 4), pady=6)
 
             _gi_col = BTN_COLORS[0]   # gold
             _gi_w, _gi_h = 160, 30
@@ -822,7 +977,7 @@ class BGYOGame:
                                        fill=dim(_gi_col, 0.40), outline="")
                 gi_cv.create_text(_gi_w // 2 + ox, _gi_h // 2 + oy,
                                   text="LOGIN / REGISTER",
-                                  fill="#000000", font=(UI_FONT, 9, "bold"),
+                                  fill="#000000", font=(UI_FONT, _fs(9), "bold"),
                                   anchor="center")
 
             _gi_pressed = [False]
@@ -885,7 +1040,7 @@ class BGYOGame:
             # Label
             tx = (x1 + x2) // 2 + ox; ty = (y1 + y2) // 2 + oy
             cv.create_text(tx, ty, text=lbl, fill="#04000C",
-                           font=(UI_FONT, 13, "bold"), anchor="center")
+                           font=(UI_FONT, _fs(13), "bold"), anchor="center")
 
     def _on_canvas_press(self, ev):
         if self.screen == "title":
@@ -944,11 +1099,12 @@ class BGYOGame:
         threading.Thread(target=_preload, daemon=True).start()
 
         outer = tk.Frame(self.root, bg=BG_COL,
-                         highlightbackground="#00E5FF", highlightthickness=2)  # Stars visible through
-        outer.place(relx=0.5, rely=0.5, anchor="center", width=min(900, int(_W*0.90)), height=min(620, int(_H*0.88)))
+                         highlightbackground="#00E5FF", highlightthickness=2)
+        outer.place(relx=0.5, rely=0.5, anchor="center",
+                    width=min(900, int(_W*0.90)), height=min(620, int(_H*0.88)))
 
         tk.Label(outer, text="♪  SELECT YOUR SONG", bg="#0a0018", fg="#00E5FF",
-                 font=(UI_FONT, 20, "bold")).pack(pady=(14, 10))
+                 font=(UI_FONT, _fs(20), "bold")).pack(pady=(14, 10))
 
         main_f = tk.Frame(outer, bg="#0a0018")
         main_f.pack(fill="both", expand=True, padx=16, pady=2)
@@ -961,7 +1117,7 @@ class BGYOGame:
 
         self._carousel_title_var = tk.StringVar(value="")
         tk.Label(left_f, textvariable=self._carousel_title_var,
-                 bg="#0a0018", fg="#FFD700", font=(UI_FONT, 13, "bold"),
+                 bg="#0a0018", fg="#FFD700", font=(UI_FONT, _fs(13), "bold"),
                  wraplength=500).pack()
 
         # Nav arrows — colorful pixel-style buttons
@@ -976,7 +1132,7 @@ class BGYOGame:
         right_f = tk.Frame(main_f, bg="#0a0018"); right_f.pack(side="right", fill="y", padx=(12, 0))
 
         tk.Label(right_f, text="DIFFICULTY", bg="#0a0018", fg="#FFD700",
-                 font=(UI_FONT, 13, "bold")).pack(anchor="w", pady=(0, 6))
+                 font=(UI_FONT, _fs(13), "bold")).pack(anchor="w", pady=(0, 6))
         self._diff_var   = tk.StringVar(value=cfg.difficulty)
         diff_cvs = {}   # val -> canvas widget
 
@@ -1007,7 +1163,7 @@ class BGYOGame:
             border = col if selected else dim(col, 0.35)
             cv_d.create_rectangle(ox, oy, DBW+ox-1, DBH+oy-1, fill="", outline=border, width=1)
             cv_d.create_text(DBW//2+ox, DBH//2+oy, text=label,
-                             fill=text_c, font=(UI_FONT, 13, "bold"), anchor="center")
+                             fill=text_c, font=(UI_FONT, _fs(13), "bold"), anchor="center")
 
         def _update_diff(selected):
             for val, cv_d in diff_cvs.items():
@@ -1043,7 +1199,7 @@ class BGYOGame:
         _update_diff(cfg.difficulty)
 
         tk.Label(right_f, text="NUMBER OF LANES", bg="#0a0018", fg="#FFD700",
-                 font=(UI_FONT, 11, "bold")).pack(anchor="w", pady=(16, 6))
+                 font=(UI_FONT, _fs(11), "bold")).pack(anchor="w", pady=(16, 6))
         self._lanes_var = tk.IntVar(value=cfg.num_lanes)
         lf2 = tk.Frame(right_f, bg="#0a0018"); lf2.pack(fill="x")
         lane_cvs = {}
@@ -1065,7 +1221,7 @@ class BGYOGame:
             border = col if selected else dim(col, 0.35)
             cv_l.create_rectangle(ox, oy, LBW+ox-1, LBH+oy-1, fill="", outline=border, width=1)
             cv_l.create_text(LBW//2+ox, LBH//2+oy, text=label,
-                             fill=text_c, font=(UI_FONT, 12, "bold"), anchor="center")
+                             fill=text_c, font=(UI_FONT, _fs(12), "bold"), anchor="center")
 
         def _update_lanes(selected):
             for val, cv_l in lane_cvs.items():
@@ -1281,7 +1437,7 @@ class BGYOGame:
         outer.place(relx=0.5, rely=0.5, anchor="center", width=panel_w, height=panel_h)
 
         tk.Label(outer, text="⚙   S E T T I N G S", bg="#0a0018", fg="#FFD700",
-                 font=(UI_FONT, 20, "bold")).pack(pady=(20, 4))
+                 font=(UI_FONT, _fs(20), "bold")).pack(pady=(20, 4))
         tk.Frame(outer, bg="#FFD700", height=1).pack(fill="x", padx=24, pady=(0, 14))
 
         body = tk.Frame(outer, bg="#0a0018"); body.pack(fill="both", expand=True, padx=32, pady=(0, 8))
@@ -1291,12 +1447,12 @@ class BGYOGame:
 
         vol_row = tk.Frame(body, bg="#0a0018"); vol_row.pack(fill="x", pady=10)
         tk.Label(vol_row, text="♪  Volume", bg="#0a0018", fg="#FFD700",
-                 font=(UI_FONT, 11, "bold"), width=14, anchor="w").pack(side="left")
+                 font=(UI_FONT, _fs(11), "bold"), width=14, anchor="w").pack(side="left")
 
         vol_var = tk.DoubleVar(value=cfg.master_volume)
         pct_lbl = tk.Label(vol_row, text=f"{int(cfg.master_volume * 100)}%",
                            bg="#0a0018", fg="#FFFFFF",
-                           font=(UI_FONT, 11, "bold"), width=5)
+                           font=(UI_FONT, _fs(11), "bold"), width=5)
         pct_lbl.pack(side="right")
 
         slider_len = max(200, panel_w - 220)
@@ -1316,12 +1472,9 @@ class BGYOGame:
             except Exception:
                 pass
 
-        tk.Scale(vol_row, variable=vol_var, from_=0.0, to=1.0, resolution=0.01,
-                 orient="horizontal", length=slider_len,
-                 bg="#0a0018", fg="#FFD700",
-                 troughcolor="#220044", activebackground="#FFD700",
-                 highlightthickness=0, sliderlength=22, width=14,
-                 command=_on_vol).pack(side="left", padx=(8, 0))
+        # make_scale() hardcodes all visual properties to override Windows theme defaults
+        make_scale(vol_row, vol_var, from_=0.0, to=1.0, resolution=0.01,
+                   length=slider_len, command=_on_vol).pack(side="left", padx=(8, 0))
 
         # ── Display section ──────────────────────────────────────────
         self._section_label(body, "DISPLAY")
@@ -1343,7 +1496,7 @@ class BGYOGame:
             lbl = "⛶  FULLSCREEN  ON" if on else "⛶  FULLSCREEN  OFF"
             fg  = "#000000" if on else dim(BTN_COLORS[2], 0.80)
             fs_cv.create_text(_fs_w//2+ox, _fs_h//2+oy, text=lbl,
-                              fill=fg, font=(UI_FONT, 11, "bold"), anchor="center")
+                              fill=fg, font=(UI_FONT, _fs(11), "bold"), anchor="center")
 
         _draw_fs_btn(cfg.fullscreen)
         _fs_pressed = [False]
@@ -1385,7 +1538,7 @@ class BGYOGame:
                 cv_btn.create_rectangle(ox, oy, bw+ox, oy+HL, fill=bright, outline="")
                 cv_btn.create_rectangle(ox, BTN_H_S+oy-SH, bw+ox, BTN_H_S+oy, fill=dark, outline="")
                 cv_btn.create_text(bw//2+ox, BTN_H_S//2+oy, text=label,
-                                   fill="#04000C", font=(UI_FONT, 13, "bold"), anchor="center")
+                                   fill="#04000C", font=(UI_FONT, _fs(13), "bold"), anchor="center")
             def _press(e):  pressed[0] = True;  _draw(True)
             def _release(e):
                 pressed[0] = False; _draw(False)
@@ -1463,13 +1616,14 @@ class BGYOGame:
         # BG_COL background lets the star/spotlight canvas show through the frame gaps
         outer = tk.Frame(self.root, bg=BG_COL,
                          highlightbackground="#FFD700", highlightthickness=2)
-        outer.place(relx=0.5, rely=0.5, anchor="center", width=min(820, int(_W*0.88)), height=min(600, int(_H*0.88)))
+        outer.place(relx=0.5, rely=0.5, anchor="center",
+                    width=min(820, int(_W*0.88)), height=min(600, int(_H*0.88)))
 
         hdr = tk.Frame(outer, bg=BG_COL); hdr.pack(pady=(20, 4))
         if "ranking_icon" in self.img_refs:
             tk.Label(hdr, image=self.img_refs["ranking_icon"], bg=BG_COL).pack(side="left", padx=(0, 10))
         tk.Label(hdr, text="THE LIGHT STAGE  —  TOP ACES", bg=BG_COL, fg="#FFD700",
-                 font=(UI_FONT, 20, "bold")).pack(side="left")
+                 font=(UI_FONT, _fs(20), "bold")).pack(side="left")
 
         # Difficulty filter tabs — colorful pixel-style
         tab_f   = tk.Frame(outer, bg=BG_COL); tab_f.pack(pady=(4, 0))
@@ -1499,7 +1653,7 @@ class BGYOGame:
             border = col if selected else dim(col, 0.35)
             cv_t.create_rectangle(ox, oy, TBW+ox-1, TBH+oy-1, fill="", outline=border, width=1)
             cv_t.create_text(TBW//2+ox, TBH//2+oy, text=label,
-                             fill=text_c, font=(UI_FONT, 11, "bold"), anchor="center")
+                             fill=text_c, font=(UI_FONT, _fs(11), "bold"), anchor="center")
 
         def _update_tabs(selected):
             for d, cv_t in tab_cvs.items():
@@ -1535,12 +1689,18 @@ class BGYOGame:
             tab_cvs[diff_name] = cv_t
         _update_tabs("All")
 
-        col_defs = [("#", 4), ("PLAYER", 18), ("SCORE", 12), ("GRADE", 7),
-                    ("ACC", 6), ("COMBO", 8), ("SONG", 16), ("DATE", 10)]
+        # Column widths are shared between the header and every data row so
+        # alignment is guaranteed regardless of content length or login state.
+        # Font size bumped to 12 for readability; widths adjusted to match.
+        col_defs = [("#", 3), ("PLAYER", 16), ("SCORE", 11), ("GRADE", 6),
+                    ("ACC", 6), ("COMBO", 7), ("SONG", 15), ("DATE", 10)]
+        ROW_FONT_SIZE = 12   # shared by header and all data rows
+
         hdr_f = tk.Frame(outer, bg="#1a0040"); hdr_f.pack(fill="x", padx=20, pady=(6, 0))
         for col_txt, col_w in col_defs:
             tk.Label(hdr_f, text=col_txt, bg="#1a0040", fg="#FFD700",
-                     font=(UI_FONT, 10, "bold"), width=col_w, anchor="center").pack(side="left", padx=2, pady=4)
+                     font=(UI_FONT, _fs(ROW_FONT_SIZE), "bold"),
+                     width=col_w, anchor="center").pack(side="left", padx=2, pady=4)
 
         table_f = tk.Frame(outer, bg="#04000C"); table_f.pack(fill="both", expand=True, padx=20, pady=2)
         scroll  = tk.Scrollbar(table_f); scroll.pack(side="right", fill="y")
@@ -1548,7 +1708,14 @@ class BGYOGame:
         rank_cv.pack(fill="both", expand=True)
         scroll.config(command=rank_cv.yview)
         rows_f  = tk.Frame(rank_cv, bg="#04000C")
+        # Stretch rows_f to the full canvas width so cells don't shrink on Windows
         rank_cv.create_window((0, 0), window=rows_f, anchor="nw")
+        rank_cv.update_idletasks()
+
+        def _on_rank_cv_configure(event):
+            # Keep the inner frame exactly as wide as the visible canvas area
+            rank_cv.itemconfig("all", width=event.width)
+        rank_cv.bind("<Configure>", _on_rank_cv_configure)
 
         rank_colors = {"S": "#FFD700", "A": "#00FF99", "B": "#00E5FF", "C": "#FF8800", "D": "#FF3385"}
 
@@ -1565,7 +1732,6 @@ class BGYOGame:
             for i, s in enumerate(scores, 1):
                 rk       = s.get("grade", "?")
                 fg_c     = rank_colors.get(rk, "#CCCCCC")
-                # Highlight the logged-in player's row with a gold-tinted background
                 is_me    = (_logged_user and
                             s.get("player_name", "").lower() == _logged_user.lower())
                 row_bg   = ("#1a1200" if is_me else
@@ -1574,27 +1740,30 @@ class BGYOGame:
                                     highlightbackground="#FFD700" if is_me else row_bg,
                                     highlightthickness=1 if is_me else 0)
                 row.pack(fill="x", pady=1)
-                # "★" star prefix on the player-name cell for logged-in user
+                # Pad non-starred names with two spaces so columns stay
+                # perfectly aligned whether the ★ indicator is present or not.
                 name_txt = (f"★ {s.get('player_name', '?')}" if is_me
-                            else s.get("player_name", "?"))
+                            else f"  {s.get('player_name', '?')}")
                 name_col = "#FFD700" if is_me else fg_c
-                cells  = [
-                    (str(i),                        4,  "#FFD700" if is_me else "#888888"),
-                    (name_txt[:18],                 18, name_col),
-                    (f"{s.get('score', 0):,}",      12, "#FFFFFF"),
-                    (rk,                             7,  fg_c),
-                    (f"{s.get('accuracy', 0)}%",     6,  "#AAAAAA"),
-                    (f"x{s.get('max_combo', 0)}",    8,  "#AAAAAA"),
-                    (s.get("song_name", "")[:14],   16, "#777777"),
-                    (s.get("played_at", "")[:10],   10, "#666666"),
+                # Column widths mirror col_defs exactly — guarantees header alignment
+                cells = [
+                    (str(i),                         3,  "#FFD700" if is_me else "#888888"),
+                    (name_txt[:16],                 16,  name_col),
+                    (f"{s.get('score', 0):,}",      11,  "#FFFFFF"),
+                    (rk,                              6,  fg_c),
+                    (f"{s.get('accuracy', 0)}%",      6,  "#AAAAAA"),
+                    (f"x{s.get('max_combo', 0)}",     7,  "#AAAAAA"),
+                    (s.get("song_name", "")[:13],    15,  "#777777"),
+                    (s.get("played_at", "")[:10],    10,  "#666666"),
                 ]
                 for txt, w_, fc in cells:
                     tk.Label(row, text=txt, bg=row_bg, fg=fc,
-                             font=(UI_FONT, 10, "bold" if is_me else "normal"),
+                             font=(UI_FONT, _fs(ROW_FONT_SIZE),
+                                   "bold" if is_me else "normal"),
                              width=w_, anchor="center").pack(side="left", padx=2, pady=3)
             if not scores:
                 tk.Label(rows_f, text="  No scores yet — play a game to be first!",
-                         bg="#04000C", fg="#666666", font=(UI_FONT, 11)).pack(pady=20)
+                         bg="#04000C", fg="#666666", font=(UI_FONT, _fs(11))).pack(pady=20)
             rows_f.update_idletasks()
             rank_cv.config(scrollregion=rank_cv.bbox("all"))
 
@@ -1608,7 +1777,7 @@ class BGYOGame:
             pb_f.pack(fill="x", padx=20, pady=(4, 0))
             tk.Label(pb_f, text=f"★  YOUR BEST — {session.username.upper()}",
                      bg="#0a0018", fg="#FFD700",
-                     font=(UI_FONT, 10, "bold")).pack(side="left", padx=(12, 20), pady=6)
+                     font=(UI_FONT, _fs(10), "bold")).pack(side="left", padx=(12, 20), pady=6)
             if pb_scores:
                 pb = pb_scores[0]
                 rk2 = pb.get("grade", "?")
@@ -1620,11 +1789,11 @@ class BGYOGame:
                     ("SONG",     pb.get("song_name", "")[:16], "#777777"),
                 ]:
                     tk.Label(pb_f, text=f"{lbl2}: {val2}", bg="#0a0018", fg=vc2,
-                             font=(UI_FONT, 9, "bold")).pack(side="left", padx=10, pady=6)
+                             font=(UI_FONT, _fs(9), "bold")).pack(side="left", padx=10, pady=6)
             else:
                 tk.Label(pb_f, text="No scores saved yet — play a game!",
                          bg="#0a0018", fg="#666666",
-                         font=(UI_FONT, 9)).pack(side="left", padx=10, pady=6)
+                         font=(UI_FONT, _fs(9))).pack(side="left", padx=10, pady=6)
 
         # Bottom button row — MAIN STAGE and ACES TRIVIA RANKINGS side-by-side
         bf = tk.Frame(outer, bg=BG_COL); bf.pack(pady=(8, 16))
@@ -1658,31 +1827,32 @@ class BGYOGame:
             tk.Label(hdr, image=self.img_refs["ranking_icon"],
                      bg=BG_COL).pack(side="left", padx=(0, 10))
         tk.Label(hdr, text="✦  ACES TRIVIA  —  TOP SCHOLARS", bg=BG_COL, fg="#FFD700",
-                 font=(UI_FONT, 20, "bold")).pack(side="left")
+                 font=(UI_FONT, _fs(20), "bold")).pack(side="left")
 
         # Subtitle — ranking criteria: accuracy first, then speed, then recency
         tk.Label(outer,
                  text="Most correct answers first  ·  equal scores ranked by fastest total time  ·  then most recent",
-                 bg=BG_COL, fg="#556677", font=(UI_FONT, 9)).pack()
+                 bg=BG_COL, fg="#556677", font=(UI_FONT, _fs(9))).pack()
 
         # ── Column header row ────────────────────────────────────────
+        # Widths shared between header labels and all data row cells — alignment guaranteed.
         TV_COL_DEFS = [
-            ("#",         4),
-            ("PLAYER",   16),
-            ("CORRECT",   9),
-            ("TOTAL",     7),
-            ("ACC %",     7),
-            ("TIME (s)",  9),
-            ("GRADE",     7),
-            ("DATE",     11),
+            ("#",         3),
+            ("PLAYER",   15),
+            ("CORRECT",   8),
+            ("TOTAL",     6),
+            ("ACC %",     6),
+            ("TIME (s)",  8),
+            ("GRADE",     6),
+            ("DATE",     10),
         ]
+        TV_ROW_FONT_SIZE = 12   # matches rhythm-game rankings for visual consistency
         hdr_f = tk.Frame(outer, bg="#1a0040"); hdr_f.pack(fill="x", padx=20, pady=(8, 0))
         for col_txt, col_w in TV_COL_DEFS:
             tk.Label(hdr_f, text=col_txt, bg="#1a0040", fg="#FFD700",
-                     font=(UI_FONT, 10, "bold"), width=col_w,
+                     font=(UI_FONT, _fs(TV_ROW_FONT_SIZE), "bold"), width=col_w,
                      anchor="center").pack(side="left", padx=2, pady=4)
 
-        # ── Scrollable table ─────────────────────────────────────────
         table_f = tk.Frame(outer, bg="#04000C")
         table_f.pack(fill="both", expand=True, padx=20, pady=2)
         tv_scroll = tk.Scrollbar(table_f); tv_scroll.pack(side="right", fill="y")
@@ -1691,7 +1861,13 @@ class BGYOGame:
         tv_cv.pack(fill="both", expand=True)
         tv_scroll.config(command=tv_cv.yview)
         tv_rows_f = tk.Frame(tv_cv, bg="#04000C")
+        # Stretch the inner frame to the full canvas width so rows fill the modal
         tv_cv.create_window((0, 0), window=tv_rows_f, anchor="nw")
+        tv_cv.update_idletasks()
+
+        def _on_tv_cv_configure(event):
+            tv_cv.itemconfig("all", width=event.width)
+        tv_cv.bind("<Configure>", _on_tv_cv_configure)
 
         # Grade colours reused from the rhythm-game leaderboard for consistency
         tv_rank_colors = {
@@ -1732,9 +1908,11 @@ class BGYOGame:
                                 highlightthickness=1 if is_me else 0)
             row.pack(fill="x", pady=1)
 
-            # Star prefix on the player-name cell for the logged-in user
+            # Star prefix on the player-name cell for the logged-in user.
+            # Non-starred names are padded with two leading spaces to keep
+            # column alignment identical whether the star is present or not.
             name_txt = (f"★ {s.get('player_name', '?')}" if is_me
-                        else s.get("player_name", "?"))
+                        else f"  {s.get('player_name', '?')}")
             name_col = "#FFD700" if is_me else grade_col
 
             # time_taken stored as float seconds; format to 1 decimal, cap display
@@ -1742,24 +1920,25 @@ class BGYOGame:
             time_disp = f"{time_val:.1f}s" if time_val > 0 else "—"
 
             tv_cells = [
-                (str(i),               4,  "#FFD700" if is_me else "#888888"),
-                (name_txt[:16],       16,  name_col),
-                (str(score_val),       9,  "#00FF99"),
-                (str(total_val),       7,  "#AAAAAA"),
-                (f"{pct_val}%",        7,  "#00E5FF"),
-                (time_disp,            9,  "#FF8800"),
-                (grade_val,            7,  grade_col),
-                (s.get("played_at", "")[:10], 11, "#666666"),
+                (str(i),               3,  "#FFD700" if is_me else "#888888"),
+                (name_txt[:15],       15,  name_col),
+                (str(score_val),       8,  "#00FF99"),
+                (str(total_val),       6,  "#AAAAAA"),
+                (f"{pct_val}%",        6,  "#00E5FF"),
+                (time_disp,            8,  "#FF8800"),
+                (grade_val,            6,  grade_col),
+                (s.get("played_at", "")[:10], 10, "#666666"),
             ]
             for txt, w_, fc in tv_cells:
                 tk.Label(row, text=txt, bg=row_bg, fg=fc,
-                         font=(UI_FONT, 10, "bold" if is_me else "normal"),
+                         font=(UI_FONT, _fs(TV_ROW_FONT_SIZE),
+                               "bold" if is_me else "normal"),
                          width=w_, anchor="center").pack(side="left", padx=2, pady=3)
 
         if not tv_scores:
             tk.Label(tv_rows_f,
                      text="  No trivia scores yet — be the first ACE Scholar!",
-                     bg="#04000C", fg="#666666", font=(UI_FONT, 11)).pack(pady=20)
+                     bg="#04000C", fg="#666666", font=(UI_FONT, _fs(11))).pack(pady=20)
 
         tv_rows_f.update_idletasks()
         tv_cv.config(scrollregion=tv_cv.bbox("all"))
@@ -1772,7 +1951,7 @@ class BGYOGame:
             pb_f2.pack(fill="x", padx=20, pady=(4, 0))
             tk.Label(pb_f2, text=f"✦  YOUR BEST TRIVIA — {session.username.upper()}",
                      bg="#0a0018", fg="#FFD700",
-                     font=(UI_FONT, 10, "bold")).pack(side="left", padx=(12, 20), pady=6)
+                     font=(UI_FONT, _fs(10), "bold")).pack(side="left", padx=(12, 20), pady=6)
             if pb_tv:
                 pb2       = pb_tv[0]
                 pb2_score = pb2.get("score", 0)
@@ -1790,11 +1969,11 @@ class BGYOGame:
                     ("DATE",    pb2.get("played_at", "")[:10], "#666666"),
                 ]:
                     tk.Label(pb_f2, text=f"{lbl3}: {val3}", bg="#0a0018", fg=vc3,
-                             font=(UI_FONT, 9, "bold")).pack(side="left", padx=10, pady=6)
+                             font=(UI_FONT, _fs(9), "bold")).pack(side="left", padx=10, pady=6)
             else:
                 tk.Label(pb_f2, text="No trivia scores saved yet — play Aces Trivia!",
                          bg="#0a0018", fg="#666666",
-                         font=(UI_FONT, 9)).pack(side="left", padx=10, pady=6)
+                         font=(UI_FONT, _fs(9))).pack(side="left", padx=10, pady=6)
 
         # ── Bottom navigation buttons ────────────────────────────────
         bf2 = tk.Frame(outer, bg=BG_COL); bf2.pack(pady=(8, 16))
@@ -1960,9 +2139,9 @@ class BGYOGame:
             cv.create_rectangle(bx1, by1, bx2, by2, fill="#0a001e", outline="")
             cv.create_rectangle(bx1, by1, bx2, by2, fill="", outline=bcol, width=2)
             cv.create_text(bcx, by1 + 14, text=blbl,
-                           fill="#8888AA", font=(UI_FONT, 8, "bold"), anchor="center")
+                           fill="#8888AA", font=(UI_FONT, _fs(8), "bold"), anchor="center")
             cv.create_text(bcx, by2 - 14, text=bval,
-                           fill=bcol, font=(MONO_FONT, 16, "bold"), anchor="center")
+                           fill=bcol, font=(MONO_FONT, _fs(16), "bold"), anchor="center")
 
         # Instruction lines
         LINES = [
@@ -2015,7 +2194,7 @@ class BGYOGame:
                                 fill=dark, outline="")
             cv.create_text((bx1+bx2)//2+ox, (btn_y1+btn_y2)//2+oy,
                            text=blabel, fill="#04000C",
-                           font=(UI_FONT, 13, "bold"), anchor="center")
+                           font=(UI_FONT, _fs(13), "bold"), anchor="center")
 
     def _start_trivia(self):
         """Start the actual trivia game (called after confirmation)."""
@@ -2060,15 +2239,15 @@ class BGYOGame:
         px_rect(hdr_cv, 0, 0, _W-24, HDR_H, CARD_BG, "#FFD700")
         # ENHANCED v18.1: Centered title
         hdr_cv.create_text((_W-24)//2, HDR_H//2, text="✦  BGYO  ACES  TRIVIA  ✦",
-                            fill="#FFD700", font=(UI_FONT, 17, "bold"), anchor="center")
+                            fill="#FFD700", font=(UI_FONT, _fs(17), "bold"), anchor="center")
 
         self._tv_qnum_var  = tk.StringVar(value="Q 1 / 12")
         self._tv_score_var = tk.StringVar(value="SCORE  0 / 0")
         # Center-aligned score and question counter in the header
         tk.Label(outer, textvariable=self._tv_score_var, bg=CARD_BG, fg="#00E5FF",
-                 font=(UI_FONT, 12, "bold")).place(relx=0.75, y=12+HDR_H//2, anchor="center")
+                 font=(UI_FONT, _fs(12), "bold")).place(relx=0.75, y=12+HDR_H//2, anchor="center")
         tk.Label(outer, textvariable=self._tv_qnum_var, bg=CARD_BG, fg="#00FF99",
-                 font=(UI_FONT, 12, "bold")).place(relx=0.25, y=12+HDR_H//2, anchor="center")
+                 font=(UI_FONT, _fs(12), "bold")).place(relx=0.25, y=12+HDR_H//2, anchor="center")
 
         self._tv_prog      = tk.Canvas(outer, width=_W-24, height=12, bg="#111122", highlightthickness=0)
         self._tv_prog.place(x=12, y=12+HDR_H+8)
@@ -2089,11 +2268,11 @@ class BGYOGame:
 
         self._tv_cat_var = tk.StringVar(value="❓  GENERAL")
         tk.Label(outer, textvariable=self._tv_cat_var, bg="#1A0040", fg="#FF8800",
-                 font=(UI_FONT, 9, "bold"), padx=8, pady=2).place(relx=0.5, y=QC_Y+14, anchor="center")
+                 font=(UI_FONT, _fs(9), "bold"), padx=8, pady=2).place(relx=0.5, y=QC_Y+14, anchor="center")
         self._tv_q_var = tk.StringVar()
         # Dark text on light card background for readability, centered
         tk.Label(outer, textvariable=self._tv_q_var, bg=QC_BG, fg="#111111",
-                 font=(UI_FONT, 13, "bold"),
+                 font=(UI_FONT, _fs(13), "bold"),
                  wraplength=_W-80, justify="center").place(relx=0.5, y=QC_Y+QC_H//2+14, anchor="center")
 
         BTN_Y = QC_Y+QC_H+18; BTN_H = 78; GAP = 12; BTN_W = (_W-24-GAP)//2
@@ -2126,7 +2305,7 @@ class BGYOGame:
             tk.Frame(badge, bg=dark_bc).place(x=BADGE_W-PX, y=0, width=PX, height=BTN_H-PX*2)
             # Dark label text for readability on colored badge
             tk.Label(badge, text=T_LABELS[i], bg=bc, fg="#000000",
-                     font=(UI_FONT, 20, "bold")).place(relx=0.5, rely=0.5, anchor="center")
+                     font=(UI_FONT, _fs(20), "bold")).place(relx=0.5, rely=0.5, anchor="center")
 
             inner_x = BADGE_W+PX*2; inner_w = BTN_W-BADGE_W-PX*3
             tk.Frame(body, bg=inner_hl).place(x=inner_x, y=PX, width=inner_w, height=PX*2)
@@ -2135,8 +2314,11 @@ class BGYOGame:
                             bg=tint_bg, fg="#111111",
                             activebackground=lighten(bc, 0.70), activeforeground="#000000",
                             disabledforeground="#888899",
-                            font=(UI_FONT, 11, "bold"), relief="flat", anchor="w",
-                            padx=10, cursor="hand2", highlightthickness=0,
+                            font=(UI_FONT, _fs(11), "bold"),
+                            # Explicit flat styling overrides Windows raised-button default
+                            relief="flat", bd=0,
+                            anchor="w", padx=10, cursor="hand2",
+                            highlightthickness=0,
                             command=lambda idx=i: self._tv_select(idx))
             btn.place(x=inner_x, y=PX*3, width=inner_w, height=BTN_H-PX*4)
             self._tv_btns.append((btn, badge, body, bc, light_bc, dark_bc, tint_bg))
@@ -2144,13 +2326,13 @@ class BGYOGame:
         # Feedback label — centered
         self._tv_fb_var = tk.StringVar()
         self._tv_fb_lbl = tk.Label(outer, textvariable=self._tv_fb_var, bg=BG, fg="#00FF99",
-                                   font=(UI_FONT, 13, "bold"), justify="center")
+                                   font=(UI_FONT, _fs(13), "bold"), justify="center")
         self._tv_fb_lbl.place(relx=0.5, y=_H-90, anchor="center")
 
         # Waiting transition text — centered
         self._tv_wait_var = tk.StringVar()
         self._tv_wait_lbl = tk.Label(outer, textvariable=self._tv_wait_var, bg=BG, fg="#FFD700",
-                                     font=(UI_FONT, 14, "bold"), justify="center")
+                                     font=(UI_FONT, _fs(14), "bold"), justify="center")
         self._tv_wait_lbl.place(relx=0.5, y=_H//2, anchor="center")
 
         # ── CONFIRM ANSWER button (hidden until a choice is selected) ──
@@ -2172,7 +2354,7 @@ class BGYOGame:
             self._tv_confirm_cv.create_text(_ca_w//2+ox, _ca_h//2+oy,
                                              text="✔  CONFIRM ANSWER",
                                              fill="#000000",
-                                             font=(UI_FONT, 13, "bold"),
+                                             font=(UI_FONT, _fs(13), "bold"),
                                              anchor="center")
         _ca_pressed = [False]
         def _ca_press(e):  _ca_pressed[0]=True;  _draw_confirm(True)
@@ -2203,7 +2385,7 @@ class BGYOGame:
         back_cv.create_rectangle(0, 0, back_w, HL, fill=back_bright, outline="")
         back_cv.create_rectangle(0, back_h-SH, back_w, back_h, fill=back_dark, outline="")
         back_cv.create_text(back_w//2, back_h//2, text="◀  BACK TO MAIN STAGE",
-                            fill="#0a0a1a", font=(UI_FONT, 13, "bold"))
+                            fill="#0a0a1a", font=(UI_FONT, _fs(13), "bold"))
 
         def _confirm_back():
             """Show a confirmation modal before leaving trivia mid-game."""
@@ -2214,16 +2396,12 @@ class BGYOGame:
             conf.configure(bg="#04000C")
             conf.resizable(False, False)
             conf.grab_set()
-            cw, ch = 420, 200
-            cx_pos = self.root.winfo_rootx() + (_W - cw) // 2
-            cy_pos = self.root.winfo_rooty() + (_H - ch) // 2
-            conf.geometry(f"{cw}x{ch}+{cx_pos}+{cy_pos}")
             tk.Label(conf, text="⚠  LEAVE TRIVIA?", bg="#04000C", fg="#FFD700",
-                     font=(UI_FONT, 16, "bold")).pack(pady=(24, 6))
+                     font=(UI_FONT, _fs(16), "bold")).pack(pady=(12, 4))
             tk.Label(conf, text="Your current progress will be lost.",
-                     bg="#04000C", fg="#00E5FF", font=(UI_FONT, 11),
-                     justify="center").pack(pady=(0, 18))
-            btn_row = tk.Frame(conf, bg="#04000C"); btn_row.pack()
+                     bg="#04000C", fg="#00E5FF", font=(UI_FONT, _fs(11)),
+                     justify="center").pack(pady=(0, 12))
+            btn_row = tk.Frame(conf, bg="#04000C"); btn_row.pack(pady=(0, 12))
             def _yes():
                 conf.destroy()
                 self._fade_to(self._show_title)
@@ -2231,6 +2409,8 @@ class BGYOGame:
                 conf.destroy()
             self._pixel_btn(btn_row, "✔  YES, LEAVE", BTN_COLORS[1], _yes, width=160).pack(side="left", padx=10)
             self._pixel_btn(btn_row, "✖  NO, STAY",  BTN_COLORS[3], _no,  width=160).pack(side="left", padx=10)
+            # Center after packing so size fits content exactly
+            center_window(conf, 380, 150)
 
         back_cv.bind("<Button-1>", lambda e: _confirm_back())
         back_cv.config(cursor="hand2")
@@ -2386,11 +2566,11 @@ class BGYOGame:
         outer.place(x=0, y=0, width=_W, height=_H)
 
         tk.Label(outer, text=grade, bg="#04000C", fg=gc,
-                 font=(TITLE_FONT, 96, "bold")).pack(pady=(50, 0))
+                 font=(TITLE_FONT, _fs(96), "bold")).pack(pady=(50, 0))
         tk.Label(outer, text=f"{s}  /  {n}  CORRECT   ·   {pct}%",
-                 bg="#04000C", fg="#FFFFFF", font=(TITLE_FONT, 18, "bold")).pack(pady=(4, 8))
+                 bg="#04000C", fg="#FFFFFF", font=(TITLE_FONT, _fs(18), "bold")).pack(pady=(4, 8))
         tk.Label(outer, text=msg, bg="#04000C", fg=gc,
-                 font=(UI_FONT, 14, "bold")).pack(pady=(0, 20))
+                 font=(UI_FONT, _fs(14), "bold")).pack(pady=(0, 20))
 
         # Total time taken this session — shown on the results screen so
         # players can see their speed before deciding to save the score.
@@ -2405,8 +2585,8 @@ class BGYOGame:
         ]:
             cell = tk.Frame(strip, bg="#0a0020", highlightbackground=vc, highlightthickness=2)
             cell.pack(side="left", padx=10, ipadx=18, ipady=10)
-            tk.Label(cell, text=lbl, bg="#0a0020", fg="#888888", font=(UI_FONT, 9, "bold")).pack()
-            tk.Label(cell, text=val, bg="#0a0020", fg=vc,       font=(MONO_FONT, 20, "bold")).pack()
+            tk.Label(cell, text=lbl, bg="#0a0020", fg="#888888", font=(UI_FONT, _fs(9), "bold")).pack()
+            tk.Label(cell, text=val, bg="#0a0020", fg=vc,       font=(MONO_FONT, _fs(20), "bold")).pack()
 
         # ── Score save section — logged-in users only; guests cannot save ─
         nf = tk.Frame(outer, bg="#04000C"); nf.pack(pady=(22, 8))
@@ -2415,32 +2595,30 @@ class BGYOGame:
             # Guest accounts: inform that saving is not available
             tk.Label(nf, text="GUEST ACCOUNT — SCORE NOT SAVED",
                      bg="#04000C", fg="#FF8800",
-                     font=(UI_FONT, 13, "bold")).pack(pady=(0, 4))
+                     font=(UI_FONT, _fs(13), "bold")).pack(pady=(0, 4))
             tk.Label(nf,
                      text="Log in or register a free account to save scores and appear on the leaderboard!",
                      bg="#04000C", fg="#888888",
-                     font=(UI_FONT, 11), justify="center", wraplength=440).pack(pady=(0, 4))
+                     font=(UI_FONT, _fs(11)), justify="center", wraplength=440).pack(pady=(0, 4))
         else:
             # Logged-in users: name is locked to their account username —
             # they cannot change it to prevent impersonation on the leaderboard.
             tk.Label(nf, text="SAVE YOUR TRIVIA SCORE:", bg="#04000C", fg="#FFD700",
-                     font=(UI_FONT, 12, "bold")).pack(pady=(0, 6))
+                     font=(UI_FONT, _fs(12), "bold")).pack(pady=(0, 6))
             name_row = tk.Frame(nf, bg="#04000C"); name_row.pack()
             name_var = tk.StringVar(value=session.username)
             # Read-only entry — name is locked to the account username
-            name_e = tk.Entry(name_row, textvariable=name_var, bg="#1a0038", fg="#00E5FF",
-                               insertbackground="#FFD700", font=(UI_FONT, 13, "bold"),
-                               relief="flat", width=20,
-                               highlightthickness=2,
-                               highlightbackground="#334466",
-                               highlightcolor="#FFD700",
-                               state="readonly")
+            # make_entry() suppresses Windows sunken border and focus rectangle
+            name_e = make_entry(name_row, name_var, bg="#1a0038", fg="#00E5FF",
+                                insert_bg="#FFD700", width=20,
+                                highlight_color="#FFD700")
+            name_e.config(state="readonly")
             name_e.pack(side="left")
             tk.Label(name_row, text="  ★ LOGGED IN", bg="#04000C", fg="#00E5FF",
-                     font=(UI_FONT, 9, "bold")).pack(side="left")
+                     font=(UI_FONT, _fs(9), "bold")).pack(side="left")
 
             name_msg = tk.Label(nf, text="", bg="#04000C", fg="#FF3385",
-                                font=(UI_FONT, 10, "bold"))
+                                font=(UI_FONT, _fs(10), "bold"))
             name_msg.pack()
 
             def _save_trivia():
@@ -2474,13 +2652,13 @@ class BGYOGame:
         outer.place(relx=0.5, rely=0.5, anchor="center", width=760, height=560)
 
         tk.Label(outer, text="★  PLAYER PROFILE", bg="#0a0018", fg="#FFD700",
-                 font=(UI_FONT, 20, "bold")).pack(pady=(22, 6))
+                 font=(UI_FONT, _fs(20), "bold")).pack(pady=(22, 6))
 
         # Avatar colour row
         av_f = tk.Frame(outer, bg="#0a0018"); av_f.pack(pady=(0, 10))
         av_sel = tk.StringVar(value=session.avatar_col)
         tk.Label(av_f, text="AVATAR COLOUR:", bg="#0a0018", fg="#888888",
-                 font=(UI_FONT, 10, "bold")).pack(side="left", padx=(0, 8))
+                 font=(UI_FONT, _fs(10), "bold")).pack(side="left", padx=(0, 8))
         av_disp = tk.Label(av_f, text="   ", bg=session.avatar_col, width=4, height=1,
                            relief="flat")
         av_disp.pack(side="left", padx=(0, 8))
@@ -2515,7 +2693,7 @@ class BGYOGame:
                 (rk,                         6,  rank_colors.get(rk,"#888")),
                 (s.get("difficulty",""),     10, "#00E5FF"),
             ]:
-                tk.Label(row, text=txt, bg="#06001A", fg=fc, font=(UI_FONT, 9),
+                tk.Label(row, text=txt, bg="#06001A", fg=fc, font=(UI_FONT, _fs(9)),
                          width=w_, anchor="center").pack(side="left", padx=2, pady=2)
         sc_rows.update_idletasks()
         sc_cv.config(scrollregion=sc_cv.bbox("all"))
@@ -2529,16 +2707,13 @@ class BGYOGame:
                                     ("Confirm", new2_var, "●")]:
             rf = tk.Frame(pw_f, bg="#0a0018"); rf.pack(side="left", padx=8)
             tk.Label(rf, text=lbl_t, bg="#0a0018", fg="#888888",
-                     font=(UI_FONT, 8, "bold")).pack()
-            tk.Entry(rf, textvariable=var, show=show_ch, bg="#0c0022", fg="#FFFFFF",
-                     insertbackground="#FFD700", font=(UI_FONT, 11),
-                     relief="flat", bd=0, width=14,
-                     highlightthickness=2,
-                     highlightbackground="#334466",
-                     highlightcolor="#FFD700").pack()
+                     font=(UI_FONT, _fs(8), "bold")).pack()
+            # make_entry() overrides Windows entry chrome for consistent sizing
+            make_entry(rf, var, show=show_ch, width=14,
+                       highlight_color="#FFD700").pack()
 
         pw_msg = tk.Label(outer, text="", bg="#0a0018", fg="#FF3385",
-                          font=(UI_FONT, 10, "bold"))
+                          font=(UI_FONT, _fs(10), "bold"))
         pw_msg.pack(pady=(6, 0))
 
         def _change_pw():
@@ -2575,28 +2750,21 @@ class BGYOGame:
         win.resizable(False, False)
         win.grab_set()   # modal
 
-        # Centre the window over the main window
-        win.update_idletasks()
-        pw_w, pw_h = 520, 500
-        mx = self.root.winfo_rootx() + (_W - pw_w) // 2
-        my = self.root.winfo_rooty() + (_H - pw_h) // 2
-        win.geometry(f"{pw_w}x{pw_h}+{mx}+{my}")
-
         BG   = "#0a0018"
         CARD = "#0a0018"
 
         # Header
-        hdr = tk.Frame(win, bg=CARD, highlightbackground="#00E5FF", highlightthickness=2)
+        hdr = tk.Frame(win, bg=CARD, highlightbackground="#00E5FF", highlightthickness=2, relief="flat")
         hdr.pack(fill="x", padx=0, pady=0)
         tk.Label(hdr, text="★  MY PROFILE", bg=CARD, fg="#00E5FF",
-                 font=(UI_FONT, 18, "bold")).pack(pady=(16, 4))
+                 font=(UI_FONT, _fs(18), "bold")).pack(pady=(10, 2))
         tk.Label(hdr, text=f"Logged in as: {session.username.upper()}", bg=CARD, fg="#888888",
-                 font=(UI_FONT, 10)).pack(pady=(0, 14))
+                 font=(UI_FONT, _fs(10))).pack(pady=(0, 8))
 
-        body = tk.Frame(win, bg="#0a0018"); body.pack(fill="both", expand=True, padx=30, pady=20)
+        body = tk.Frame(win, bg="#0a0018"); body.pack(fill="both", expand=True, padx=20, pady=10)
 
         msg_var = tk.StringVar()
-        msg_lbl = tk.Label(body, textvariable=msg_var, bg="#0a0018", font=(UI_FONT, 10, "bold"),
+        msg_lbl = tk.Label(body, textvariable=msg_var, bg="#0a0018", font=(UI_FONT, _fs(10), "bold"),
                            wraplength=440)
         # placed at bottom — packed after sections so it appears last
 
@@ -2605,13 +2773,10 @@ class BGYOGame:
         cur_pw_var = tk.StringVar()
         cur_row = tk.Frame(body, bg=BG); cur_row.pack(fill="x", pady=(4, 8))
         tk.Label(cur_row, text="Current Password:", bg=BG, fg="#888888",
-                 font=(UI_FONT, 10, "bold"), width=18, anchor="w").pack(side="left")
-        cur_pw_e = tk.Entry(cur_row, textvariable=cur_pw_var, show="●",
-                            bg="#0c0022", fg="#FFFFFF", insertbackground="#FFD700",
-                            font=(UI_FONT, 12, "bold"), relief="flat", width=20,
-                            highlightthickness=2,
-                            highlightbackground="#334466",
-                            highlightcolor="#FFD700")
+                 font=(UI_FONT, _fs(10), "bold"), width=18, anchor="w").pack(side="left")
+        # make_entry() fixes Windows entry border and focus ring
+        cur_pw_e = make_entry(cur_row, cur_pw_var, show="●", width=20,
+                              highlight_color="#FFD700")
         cur_pw_e.pack(side="left", padx=(8, 0))
         cur_pw_e.focus_set()
 
@@ -2620,34 +2785,28 @@ class BGYOGame:
         new_uname_var = tk.StringVar()
         un_row = tk.Frame(body, bg=BG); un_row.pack(fill="x", pady=(4, 0))
         tk.Label(un_row, text="New Username:", bg=BG, fg="#888888",
-                 font=(UI_FONT, 10, "bold"), width=18, anchor="w").pack(side="left")
-        tk.Entry(un_row, textvariable=new_uname_var, bg="#0c0022", fg="#FFFFFF",
-                 insertbackground="#00E5FF", font=(UI_FONT, 12, "bold"),
-                 relief="flat", width=20,
-                 highlightthickness=2,
-                 highlightbackground="#334466",
-                 highlightcolor="#00E5FF").pack(side="left", padx=(8, 0))
+                 font=(UI_FONT, _fs(10), "bold"), width=18, anchor="w").pack(side="left")
+        # make_entry() overrides Windows border; cyan highlight matches macOS design
+        make_entry(un_row, new_uname_var, insert_bg="#00E5FF", width=20,
+                   highlight_color="#00E5FF").pack(side="left", padx=(8, 0))
         tk.Label(body, text="3-24 chars  •  Leave blank to skip",
-                 bg=BG, fg="#445566", font=(UI_FONT, 8)).pack(anchor="w", pady=(2, 8))
+                 bg=BG, fg="#445566", font=(UI_FONT, _fs(8))).pack(anchor="w", pady=(2, 4))
 
         # ── Change password ─────────────────────────────────────────
         self._section_label(body, "CHANGE PASSWORD")
         new_pw_var  = tk.StringVar()
         new_pw2_var = tk.StringVar()
         for lbl_t, var in [("New Password:", new_pw_var), ("Confirm New:", new_pw2_var)]:
-            prow = tk.Frame(body, bg=BG); prow.pack(fill="x", pady=3)
+            prow = tk.Frame(body, bg=BG); prow.pack(fill="x", pady=2)
             tk.Label(prow, text=lbl_t, bg=BG, fg="#888888",
-                     font=(UI_FONT, 10, "bold"), width=18, anchor="w").pack(side="left")
-            tk.Entry(prow, textvariable=var, show="●", bg="#0c0022", fg="#FFFFFF",
-                     insertbackground="#FF3385", font=(UI_FONT, 12, "bold"),
-                     relief="flat", width=20,
-                     highlightthickness=2,
-                     highlightbackground="#334466",
-                     highlightcolor="#FF3385").pack(side="left", padx=(8, 0))
+                     font=(UI_FONT, _fs(10), "bold"), width=18, anchor="w").pack(side="left")
+            # make_entry() keeps password field dimensions identical to macOS
+            make_entry(prow, var, show="●", insert_bg="#FF3385", width=20,
+                       highlight_color="#FF3385").pack(side="left", padx=(8, 0))
         tk.Label(body, text="Min 6 chars  •  Leave blank to skip",
-                 bg=BG, fg="#445566", font=(UI_FONT, 8)).pack(anchor="w", pady=(2, 0))
+                 bg=BG, fg="#445566", font=(UI_FONT, _fs(8))).pack(anchor="w", pady=(2, 0))
 
-        msg_lbl.pack(pady=(12, 0))
+        msg_lbl.pack(pady=(8, 0))
 
         def _do_save():
             cur_pw  = cur_pw_var.get()
@@ -2694,9 +2853,11 @@ class BGYOGame:
             else:
                 msg_var.set("No changes were made."); msg_lbl.config(fg="#888888")
 
-        btn_row = tk.Frame(body, bg=BG); btn_row.pack(pady=(14, 0))
+        btn_row = tk.Frame(body, bg=BG); btn_row.pack(pady=(10, 8))
         self._pixel_btn(btn_row, "✔  SAVE CHANGES", BTN_COLORS[0], _do_save, width=180).pack(side="left", padx=8)
         self._pixel_btn(btn_row, "✖  CLOSE",        BTN_COLORS[1], win.destroy, width=120).pack(side="left", padx=8)
+        # Center after packing so the window fits its content tightly
+        center_window(win, 500, 420)
 
     # ═══════════════════════════════════════════════════════════════
     #  GAME LOGIC
@@ -2778,7 +2939,7 @@ class BGYOGame:
             self._overlay_btn.create_rectangle(ox, _mh+oy-3, _mw+ox, _mh+oy, fill=dark, outline="")
             self._overlay_btn.create_text(_mw//2+ox, _mh//2+oy, text=label,
                                           fill="#000000",
-                                          font=(UI_FONT, 9, "bold"), anchor="center")
+                                          font=(UI_FONT, _fs(9), "bold"), anchor="center")
 
         _mb_pressed = [False]
         def _mb_press(e):  _mb_pressed[0]=True;  _draw_menu_btn(self._overlay_btn_col, self._overlay_btn_label, True)
@@ -2821,7 +2982,7 @@ class BGYOGame:
         self._overlay_frame = overlay
 
         tk.Label(overlay, text="⏸  GAME  MENU", bg="#0a0018", fg="#FFD700",
-                 font=(TITLE_FONT, 18, "bold")).pack(pady=(22, 4))
+                 font=(TITLE_FONT, _fs(18), "bold")).pack(pady=(22, 4))
         tk.Frame(overlay, bg="#FFD700", height=1).pack(fill="x", padx=30, pady=(0, 14))
 
         # ── Single Volume slider — controls all audio ───────────────
@@ -2829,11 +2990,11 @@ class BGYOGame:
 
         vol_row = tk.Frame(vol_body, bg="#0a0018"); vol_row.pack(fill="x", pady=5)
         tk.Label(vol_row, text="♪  Volume", bg="#0a0018", fg="#FFD700",
-                 font=(UI_FONT, 10, "bold"), width=12, anchor="w").pack(side="left")
+                 font=(UI_FONT, _fs(10), "bold"), width=12, anchor="w").pack(side="left")
         self._ingame_vol_var = tk.DoubleVar(value=cfg.master_volume)
         ig_pct = tk.Label(vol_row, text=f"{int(cfg.master_volume * 100)}%",
                           bg="#0a0018", fg="#FFFFFF",
-                          font=(UI_FONT, 10, "bold"), width=5)
+                          font=(UI_FONT, _fs(10), "bold"), width=5)
         ig_pct.pack(side="right")
 
         def _on_all_vol(v):
@@ -2849,12 +3010,10 @@ class BGYOGame:
             except Exception:
                 pass
 
-        tk.Scale(vol_row, variable=self._ingame_vol_var, from_=0.0, to=1.0,
-                 resolution=0.01, orient="horizontal", length=230,
-                 bg="#0a0018", fg="#FFD700", troughcolor="#220044",
-                 activebackground="#FFD700",
-                 highlightthickness=0, sliderlength=18, width=12,
-                 command=_on_all_vol).pack(side="left", padx=(8, 0))
+        # make_scale() overrides Windows trough colour and slider chrome
+        make_scale(vol_row, self._ingame_vol_var, from_=0.0, to=1.0,
+                   resolution=0.01, length=230,
+                   command=_on_all_vol).pack(side="left", padx=(8, 0))
 
         btn_f = tk.Frame(overlay, bg="#0a0018"); btn_f.pack(pady=(10, 0))
 
@@ -2897,7 +3056,7 @@ class BGYOGame:
             lbl = "⛶  FULLSCREEN  ON" if on else "⛶  FULLSCREEN  OFF"
             fg  = "#000000" if on else dim(BTN_COLORS[2], 0.85)
             fs2_cv.create_text(_fs2_w//2+ox, _fs2_h//2+oy, text=lbl,
-                               fill=fg, font=(UI_FONT, 11, "bold"), anchor="center")
+                               fill=fg, font=(UI_FONT, _fs(11), "bold"), anchor="center")
 
         _draw_fs2_btn(cfg.fullscreen)
         _fs2_pressed = [False]
@@ -3038,7 +3197,7 @@ class BGYOGame:
         outer.place(relx=0.5, rely=0.5, anchor="center", width=min(580, int(_W*0.82)), height=min(440, int(_H*0.82)))
 
         tk.Label(outer, text=rank, bg="#04000C", fg=rc,
-                 font=(TITLE_FONT, 80, "bold")).pack(pady=(16, 0))
+                 font=(TITLE_FONT, _fs(80), "bold")).pack(pady=(16, 0))
 
         sf = tk.Frame(outer, bg="#04000C"); sf.pack(pady=(0, 16))
         for lbl, val in [("SCORE", f"{gs['score']:,}"),
@@ -3047,18 +3206,18 @@ class BGYOGame:
             cf = tk.Frame(sf, bg="#0a0020", highlightbackground=rc, highlightthickness=1)
             cf.pack(side="left", padx=8, ipadx=16, ipady=8)
             tk.Label(cf, text=lbl, bg="#0a0020", fg="#888888",
-                     font=(UI_FONT, 8, "bold")).pack()
+                     font=(UI_FONT, _fs(8), "bold")).pack()
             tk.Label(cf, text=val, bg="#0a0020", fg=rc,
-                     font=(MONO_FONT, 18, "bold")).pack()
+                     font=(MONO_FONT, _fs(18), "bold")).pack()
 
         if session.is_guest:
             # Guests cannot save scores — show info and go straight to gameover
             tk.Label(outer, text="PERFORMANCE COMPLETE",
-                     bg="#04000C", fg="#FFFFFF", font=(UI_FONT, 13, "bold")).pack(pady=(6, 4))
+                     bg="#04000C", fg="#FFFFFF", font=(UI_FONT, _fs(13), "bold")).pack(pady=(6, 4))
             tk.Label(outer, text="Log in to save scores to the leaderboard.",
-                     bg="#04000C", fg="#888888", font=(UI_FONT, 11)).pack(pady=(0, 8))
+                     bg="#04000C", fg="#888888", font=(UI_FONT, _fs(11))).pack(pady=(0, 8))
             tk.Label(outer, text="Playing as Guest — scores are not saved.",
-                     bg="#04000C", fg="#FF8800", font=(UI_FONT, 10, "bold")).pack(pady=(0, 16))
+                     bg="#04000C", fg="#FF8800", font=(UI_FONT, _fs(10), "bold")).pack(pady=(0, 16))
             bf = tk.Frame(outer, bg="#04000C"); bf.pack(pady=(4, 0))
             self._pixel_btn(bf, "▶  CONTINUE", BTN_COLORS[0],
                             lambda: self._fade_to(self._show_gameover), width=200).pack(side="left", padx=8)
@@ -3068,26 +3227,24 @@ class BGYOGame:
 
         # ── Logged-in user: show read-only name + optional save ──────
         tk.Label(outer, text="SAVE YOUR SCORE TO THE LEADERBOARD",
-                 bg="#04000C", fg="#FFFFFF", font=(UI_FONT, 13, "bold")).pack(pady=(6, 16))
+                 bg="#04000C", fg="#FFFFFF", font=(UI_FONT, _fs(13), "bold")).pack(pady=(6, 16))
 
         ef = tk.Frame(outer, bg="#04000C"); ef.pack(pady=(0, 8))
         tk.Label(ef, text="NAME:", bg="#04000C", fg="#FFD700",
-                 font=(UI_FONT, 12, "bold")).pack(side="left", padx=(0, 8))
+                 font=(UI_FONT, _fs(12), "bold")).pack(side="left", padx=(0, 8))
         name_var = tk.StringVar(value=session.username)
         # Read-only entry — logged-in users cannot change their name
-        name_e = tk.Entry(ef, textvariable=name_var, bg="#1a0038", fg="#00E5FF",
-                          insertbackground="#FFD700", font=(UI_FONT, 14, "bold"),
-                          relief="flat", width=18,
-                          highlightthickness=2,
-                          highlightbackground="#334466",
-                          highlightcolor="#FFD700",
-                          state="readonly")
+        # make_entry() prevents Windows from rendering a raised 3D border here
+        name_e = make_entry(ef, name_var, bg="#1a0038", fg="#00E5FF",
+                            insert_bg="#FFD700", width=18,
+                            highlight_color="#FFD700")
+        name_e.config(state="readonly")
         name_e.pack(side="left")
         tk.Label(ef, text=f"  ★ LOGGED IN", bg="#04000C", fg="#00E5FF",
-                 font=(UI_FONT, 9, "bold")).pack(side="left")
+                 font=(UI_FONT, _fs(9), "bold")).pack(side="left")
 
         msg_lbl = tk.Label(outer, text="", bg="#04000C", fg="#FF3385",
-                           font=(UI_FONT, 10, "bold"))
+                           font=(UI_FONT, _fs(10), "bold"))
         msg_lbl.pack()
 
         def submit():
@@ -3129,10 +3286,10 @@ class BGYOGame:
         outer = tk.Frame(self.root, bg="#04000C",
                          highlightbackground=rc, highlightthickness=3)
         outer.place(relx=0.5, rely=0.5, anchor="center")
-        tk.Label(outer, text=rank,    bg="#04000C", fg=rc,       font=(TITLE_FONT, 100, "bold")).pack()
+        tk.Label(outer, text=rank,    bg="#04000C", fg=rc,       font=(TITLE_FONT, _fs(100), "bold")).pack()
         tk.Label(outer, text="PERFORMANCE COMPLETE",
-                 bg="#04000C", fg="#FF3385", font=(TITLE_FONT, 24, "bold")).pack()
-        tk.Label(outer, text=msg, bg="#04000C", fg="#aaaaaa",    font=(UI_FONT, 13)).pack(pady=(4, 22))
+                 bg="#04000C", fg="#FF3385", font=(TITLE_FONT, _fs(24), "bold")).pack()
+        tk.Label(outer, text=msg, bg="#04000C", fg="#aaaaaa",    font=(UI_FONT, _fs(13))).pack(pady=(4, 22))
 
         grid = tk.Frame(outer, bg="#04000C"); grid.pack(pady=(0, 24))
         for i, (lbl, val) in enumerate([
@@ -3142,8 +3299,8 @@ class BGYOGame:
             r, c = divmod(i, 2)
             cell = tk.Frame(grid, bg="#0a0020", highlightbackground=rc, highlightthickness=1)
             cell.grid(row=r, column=c, padx=10, pady=8, ipadx=22, ipady=10)
-            tk.Label(cell, text=lbl, bg="#0a0020", fg="#888888", font=(UI_FONT, 9, "bold")).pack()
-            tk.Label(cell, text=val, bg="#0a0020", fg=rc,        font=(MONO_FONT, 26, "bold")).pack()
+            tk.Label(cell, text=lbl, bg="#0a0020", fg="#888888", font=(UI_FONT, _fs(9), "bold")).pack()
+            tk.Label(cell, text=val, bg="#0a0020", fg=rc,        font=(MONO_FONT, _fs(26), "bold")).pack()
 
         bf = tk.Frame(outer, bg="#04000C"); bf.pack(pady=(0, 16))
         self._pixel_btn(bf, "▶  PLAY AGAIN", BTN_COLORS[0],
@@ -3233,9 +3390,10 @@ class BGYOGame:
         if self.screen == "trivia":
             self._update_timer_bar()
 
-        # Update animated border for login/register screens
+        # Animate border and title on login/register screens each frame
         if self.screen in ("login", "register"):
             self._update_login_container_border()
+            self._update_title_color()
 
         try:
             self._draw(dt)
@@ -3265,47 +3423,88 @@ class BGYOGame:
             self._draw_title_graphics(cv)
             self._draw_nav_buttons(cv)
             self._draw_led_ticker(cv, dt)
-            # Animate the logged-in user badge border glow
+            # Animate the logged-in user badge border — delegates to update_neon_border
             if hasattr(self, '_badge_frame') and self._badge_frame:
                 try:
-                    glow_colors = ["#FFD700", "#FF3385", "#00E5FF", "#FF8800", "#CC44FF"]
-                    gp = (self.t * 0.5) % 1.0
-                    gi0 = int(gp * len(glow_colors)) % len(glow_colors)
-                    gi1 = (gi0 + 1) % len(glow_colors)
-                    gf2 = (gp * len(glow_colors)) - gi0
-                    gc  = blend(glow_colors[gi0], glow_colors[gi1], gf2)
-                    self._badge_frame.config(highlightbackground=gc, highlightthickness=2)
+                    update_neon_border(self._badge_frame, self.t, speed=0.50)
                 except Exception:
                     pass
         if self.screen == "pre_game":
             self._carousel_render()
         if self.screen == "trivia_confirm":
             self._draw_trivia_confirm_canvas(cv)
+        # Animate glowing borders on all tk Frame overlays every frame
+        self._animate_all_borders()
         # Transition overlay always drawn last — covers everything during fades
         self._draw_transition(dt)
 
+    def _animate_all_borders(self):
+        """
+        Animate highlightbackground on every bordered Frame overlay.
+        Throttled to every 4th frame — border colour changes are slow enough
+        (~0.38 rev/s) that skipping intermediate frames is imperceptible but
+        cuts the number of tk config() calls by 75 %, reducing CPU load.
+        """
+        # Frame counter drives the throttle — initialised lazily
+        if not hasattr(self, "_border_frame_ctr"):
+            self._border_frame_ctr = 0
+        self._border_frame_ctr += 1
+        if self._border_frame_ctr % 4 != 0:
+            return
+        try:
+            for widget in self.root.winfo_children():
+                if widget is self.cv:
+                    continue
+                self._animate_frame_border_recursive(widget, depth=0)
+        except Exception:
+            pass
+
+    def _animate_frame_border_recursive(self, widget, depth: int = 0):
+        """Recursively apply glow to bordered Frame widgets (max depth 6)."""
+        if depth > 6:
+            return
+        try:
+            if not widget.winfo_exists():
+                return
+            if isinstance(widget, (tk.Frame, tk.LabelFrame)):
+                try:
+                    ht = int(widget.cget("highlightthickness"))
+                except Exception:
+                    ht = 0
+                if ht > 0:
+                    update_neon_border(widget, self.t, speed=0.38)
+            for child in widget.winfo_children():
+                self._animate_frame_border_recursive(child, depth + 1)
+        except Exception:
+            pass
+
     # ── Background ────────────────────────────────────────────────────
     def _draw_bg(self, cv):
-        segs = 20
+        # Fewer segments on UI-only screens (login/register/menus) — imperceptible
+        # quality difference but cuts Canvas rectangle calls by half.
+        segs = 12 if self.screen in ("login", "register", "rankings",
+                                      "trivia_rankings", "settings",
+                                      "pre_game", "profile") else 20
         for i in range(segs):
             t2 = i / segs
             r2 = _clamp(6  + t2 * 10)
             b2 = _clamp(18 + t2 * 50)
             y0 = int(_H * i / segs); y1 = int(_H * (i + 1) / segs)
             cv.create_rectangle(0, y0, _W, y1, fill=f"#{r2:02x}00{b2:02x}", outline="")
-        
-        # Concert lights — always visible on title/game screens
+
+        # Concert spotlights — full rendering on title/game, simplified elsewhere
         for sl in self.spotlights:
             sl.draw(cv, self.t, _W, _H)
-        # Twinkling stars — always visible
-        for s in self.stars:
+        # Twinkling stars — draw every star on game/title, every 2nd on UI screens
+        step = 1 if self.screen in ("title", "game", "trivia_confirm") else 2
+        for s in self.stars[::step]:
             x  = s["nx"] * _W
             y  = s["ny"] * _H
             ph = s["ph"]
             a  = 0.55 + 0.45 * abs(math.sin(self.t * 0.7 + ph))
             r  = s["r"] * (0.9 + 0.4 * a)
-            cv.create_oval(x - r, y - r, x + r, y + r, 
-                          fill=dim("#FFFFFF", a), outline="")
+            cv.create_oval(x - r, y - r, x + r, y + r,
+                           fill=dim("#FFFFFF", a), outline="")
 
     # ── Title graphics ────────────────────────────────────────────────
     def _draw_title_graphics(self, cv):
@@ -3446,7 +3645,9 @@ class BGYOGame:
         combo      = self.gs.get("combo", 0) if self.screen == "game" else 0
         brightness = min(1.0, 0.55 + combo * 0.012)  # Increased base from 0.45 to 0.55
 
-        grid_steps = 28
+        # Reduced from 28 to 22 rows to match game_renderer.draw_track()
+        # and cut per-frame Canvas line calls on the title/login screens.
+        grid_steps = 22
         for i in range(grid_steps):
             d   = (i / (grid_steps - 1)) ** 1.4
             lp  = _project(0, d); rp = _project(1, d)
@@ -3614,15 +3815,15 @@ class BGYOGame:
         # Outer neon glow
         cv.create_text(x, cheer_y, text=cheer,
                        fill=dim(cyc, alpha * 0.28),
-                       font=(TITLE_FONT, 30, "bold"), anchor="center")
+                       font=(TITLE_FONT, _fs(30), "bold"), anchor="center")
         # Drop shadow
         cv.create_text(x + 2, cheer_y + 2, text=cheer,
                        fill=dim("#000000", alpha * 0.80),
-                       font=(TITLE_FONT, 26, "bold"), anchor="center")
+                       font=(TITLE_FONT, _fs(26), "bold"), anchor="center")
         # Main vivid text
         cv.create_text(x, cheer_y, text=cheer,
                        fill=dim(cyc, alpha * 0.95),
-                       font=(TITLE_FONT, 26, "bold"), anchor="center")
+                       font=(TITLE_FONT, _fs(26), "bold"), anchor="center")
 
         # Orbiting stars
         if alpha > 0.3:
@@ -3672,11 +3873,11 @@ class BGYOGame:
         cv.create_rectangle(int(self.sx(12)), 14, int(self.sx(192)), 76,
                             fill="#030010", outline=dim("#FFD700", _sc_pulse * 0.70), width=1)
         cv.create_text(int(self.sx(22)), 22, text="SCORE", fill=dim("#FFD700", 0.75),
-                       anchor="w", font=(UI_FONT, 9, "bold"))
+                       anchor="w", font=(UI_FONT, _fs(9), "bold"))
         cv.create_text(int(self.sx(23)), 51, text=f"{gs['score']:,}", fill="#000000",
-                       anchor="w", font=(MONO_FONT, 21, "bold"))
+                       anchor="w", font=(MONO_FONT, _fs(21), "bold"))
         cv.create_text(int(self.sx(22)), 50, text=f"{gs['score']:,}", fill="#FFFFFF",
-                       anchor="w", font=(MONO_FONT, 21, "bold"))
+                       anchor="w", font=(MONO_FONT, _fs(21), "bold"))
 
         # Center HUD — song title LED scrolling effect + cover art
         names    = gs.get("song_names", []); idx = gs.get("song_idx", 0)
@@ -3755,7 +3956,7 @@ class BGYOGame:
             ("#555555", "◌ NO AUDIO")
         )
         cv.create_text(text_area_cx, 58, text=bm_txt, fill=bm_col,
-                       font=(UI_FONT, 8, "bold"), anchor="center")
+                       font=(UI_FONT, _fs(8), "bold"), anchor="center")
 
         # Combo (right) — subtle glowing border box
         _cb_pulse = 0.45 + 0.25 * math.sin(self.t * 2.1 + 1.0)
@@ -3764,36 +3965,36 @@ class BGYOGame:
         cv.create_rectangle(_W - int(self.sx(192)), 14, _W - int(self.sx(12)), 76,
                             fill="#030010", outline=dim("#00E5FF", _cb_pulse * 0.70), width=1)
         cv.create_text(_W - int(self.sx(22)), 22, text="COMBO", fill=dim("#FFD700", 0.75),
-                       anchor="e", font=(UI_FONT, 9, "bold"))
+                       anchor="e", font=(UI_FONT, _fs(9), "bold"))
         cv.create_text(_W - int(self.sx(21)), 51, text=str(gs["combo"]), fill="#000000",
-                       anchor="e", font=(MONO_FONT, 21, "bold"))
+                       anchor="e", font=(MONO_FONT, _fs(21), "bold"))
         cv.create_text(_W - int(self.sx(22)), 50, text=str(gs["combo"]), fill="#FFFFFF",
-                       anchor="e", font=(MONO_FONT, 21, "bold"))
+                       anchor="e", font=(MONO_FONT, _fs(21), "bold"))
 
         # Member / difficulty — positioned well below the stage hit bar
         m   = gs["member_idx"] % len(MEMBER_NAMES)
         col = MEMBER_COLORS[m]; pls = 0.70 + 0.30 * math.sin(self.t * 2.4)
         cv.create_text(_W // 2 + 2, _H - int(self.sy(52)) + 2, text=MEMBER_NAMES[m],
-                       fill=dim("#000000", 0.85), font=(TITLE_FONT, 24, "bold"))
+                       fill=dim("#000000", 0.85), font=(TITLE_FONT, _fs(24), "bold"))
         cv.create_text(_W // 2, _H - int(self.sy(52)), text=MEMBER_NAMES[m],
-                       fill=dim(col, pls), font=(TITLE_FONT, 24, "bold"))
+                       fill=dim(col, pls), font=(TITLE_FONT, _fs(24), "bold"))
         cv.create_text(_W // 2 + 1, _H - int(self.sy(28)) + 1, text=MEMBER_ROLES[m],
-                       fill=dim("#000000", 0.75), font=(UI_FONT, 9))
+                       fill=dim("#000000", 0.75), font=(UI_FONT, _fs(9)))
         cv.create_text(_W // 2, _H - int(self.sy(28)), text=MEMBER_ROLES[m],
-                       fill="#00E5FF",     font=(UI_FONT, 9))
+                       fill="#00E5FF",     font=(UI_FONT, _fs(9)))
 
         dc = {"Easy": "#00FF99", "Normal": "#00E5FF", "Hard": "#FFD700", "ACE": "#FF3385"}
         cv.create_text(_W-14, _H-50, text=cfg.difficulty, anchor="se",
-                       fill=dc.get(cfg.difficulty, "#fff"), font=(UI_FONT, 10, "bold"))
+                       fill=dc.get(cfg.difficulty, "#fff"), font=(UI_FONT, _fs(10), "bold"))
 
         lbl_map = {5: "5 LANES  D·F·J·K·L", 4: "4 LANES  F·J·K·L", 3: "3 LANES  F·J·L"}
         cv.create_text(_W-14, _H-32, text=lbl_map.get(LANES, ""), anchor="se",
-                       fill="#556677", font=(UI_FONT, 8, "bold"))
+                       fill="#556677", font=(UI_FONT, _fs(8), "bold"))
 
         cv.create_text(14, _H-50, text="SPACE  Pause", anchor="sw",
-                       fill="#445566", font=(UI_FONT, 8, "bold"))
+                       fill="#445566", font=(UI_FONT, _fs(8), "bold"))
         cv.create_text(14, _H-32, text=f"♪ {int(self._game_volume*100)}%   +/- Vol", anchor="sw",
-                       fill="#445566", font=(UI_FONT, 8, "bold"))
+                       fill="#445566", font=(UI_FONT, _fs(8), "bold"))
 
         # Perfect / Good / Miss counters — glowing border box, higher for visibility
         pgm_y     = int(self.sy(88))
@@ -3809,9 +4010,9 @@ class BGYOGame:
             (80,  "GOOD",    str(gs["good"]),    "#00E5FF"),
             (140, "MISS",    str(gs["miss"]),    "#FF3385"),
         ]:
-            cv.create_text(xi, pgm_lbl_y, text=lbl, fill=dim(fc, 0.85), anchor="w", font=(UI_FONT, 8, "bold"))
-            cv.create_text(xi+1, pgm_val_y+1, text=val, fill="#000000", anchor="w", font=(MONO_FONT, 13, "bold"))
-            cv.create_text(xi,   pgm_val_y,   text=val, fill="#FFFFFF",  anchor="w", font=(MONO_FONT, 13, "bold"))
+            cv.create_text(xi, pgm_lbl_y, text=lbl, fill=dim(fc, 0.85), anchor="w", font=(UI_FONT, _fs(8), "bold"))
+            cv.create_text(xi+1, pgm_val_y+1, text=val, fill="#000000", anchor="w", font=(MONO_FONT, _fs(13), "bold"))
+            cv.create_text(xi,   pgm_val_y,   text=val, fill="#FFFFFF",  anchor="w", font=(MONO_FONT, _fs(13), "bold"))
 
     # ── LED song ticker (title screen) ───────────────────────────────
     def _draw_led_ticker(self, cv, dt):
@@ -3866,11 +4067,11 @@ class BGYOGame:
                 # Shadow
                 cv.create_text(x + 1, cy + 1, text=seg_text,
                                fill=dim("#000000", 0.7), anchor="w",
-                               font=(UI_FONT, 9, "bold"))
+                               font=(UI_FONT, _fs(9), "bold"))
                 # Coloured text
                 cv.create_text(x, cy, text=seg_text,
                                fill=dim(seg_col, pulse), anchor="w",
-                               font=(UI_FONT, 9, "bold"))
+                               font=(UI_FONT, _fs(9), "bold"))
                 x += seg_w
 
 

@@ -556,10 +556,10 @@ class Spotlight:
         #
         # hw_frac : fraction of `hw` used as the half-width of this layer.
         # b_frac  : brightness multiplier for this layer's fill colour.
+        # Reduced from 4 layers to 3 for performance; visual quality maintained.
         layers = [
-            (1.00, max(self.MIN_B, brightness * 0.05)),   # outermost — just a halo
-            (0.60, max(self.MIN_B, brightness * 0.11)),
-            (0.28, max(self.MIN_B, brightness * 0.24)),
+            (1.00, max(self.MIN_B, brightness * 0.06)),   # outermost — soft halo
+            (0.35, max(self.MIN_B, brightness * 0.22)),   # mid glow
             (0.10, max(self.MIN_B, brightness * 0.48)),   # core — bright but still soft
         ]
 
@@ -602,7 +602,9 @@ class Spotlight:
         # hex_to_rgb calls inside the tight 28-iteration loop.
         r0, g0, b0 = hex_to_rgb(self.col)
 
-        NUM_RAYS = 28
+        # Reduced from 28 to 18 outer rays — still produces a full, smooth
+        # glow pool on the floor while cutting Canvas line calls by ~36%.
+        NUM_RAYS = 18
         for ri in range(NUM_RAYS):
             # Distribute rays evenly around the full ellipse
             ang = (ri / NUM_RAYS) * 2 * math.pi
@@ -625,10 +627,10 @@ class Spotlight:
                            width=1)   # 1px — adds light without filling area
 
         # ── 4. Floor glow — inner rays (hotspot) ─────────────────
-        # 16 shorter, brighter rays at 35% of the outer radius.
-        # Phase-offset by half a step (pi/NUM_INNER) so inner rays
-        # fall between outer rays, filling the centre more evenly.
-        NUM_INNER = 16
+        # 10 shorter, brighter rays at 35% of the outer radius (reduced from 16
+        # for performance; the hotspot centre still reads clearly with 10 rays).
+        # Phase-offset by half a step so inner rays fall between outer rays.
+        NUM_INNER = 10
         for ri in range(NUM_INNER):
             ang = (ri / NUM_INNER) * 2 * math.pi + (math.pi / NUM_INNER)
             ex  = tip_x + math.cos(ang) * pool_rx * 0.35
